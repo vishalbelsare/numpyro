@@ -1,7 +1,7 @@
 # Copyright Contributors to the Pyro project.
 # SPDX-License-Identifier: Apache-2.0
 
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 import functools
 import re
@@ -42,6 +42,17 @@ def plate_to_enum_plate():
         numpyro.plate.__new__ = lambda *args, **kwargs: object.__new__(numpyro.plate)
 
 
+def _config_enumerate_fn(site, default):
+    """helper function used internally in config_enumerate"""
+    if (
+        site["type"] == "sample"
+        and (not site["is_observed"])
+        and site["fn"].has_enumerate_support
+    ):
+        return {"enumerate": site["infer"].get("enumerate", default)}
+    return {}
+
+
 def config_enumerate(fn=None, default="parallel"):
     """
     Configures enumeration for all relevant sites in a NumPyro model.
@@ -69,16 +80,47 @@ def config_enumerate(fn=None, default="parallel"):
     if fn is None:  # support use as a decorator
         return functools.partial(config_enumerate, default=default)
 
-    def config_fn(site):
-        if (
-            site["type"] == "sample"
-            and (not site["is_observed"])
-            and site["fn"].has_enumerate_support
-        ):
-            return {"enumerate": site["infer"].get("enumerate", default)}
-        return {}
+    return infer_config(fn, functools.partial(_config_enumerate_fn, default=default))
 
-    return infer_config(fn, config_fn)
+
+def _config_kl_fn(site, sites):
+    """helper function used internally in config_kl"""
+    if (
+        site["type"] == "sample"
+        and (not site["is_observed"])
+        and (sites is None or site["name"] in sites)
+    ):
+        return {"kl": site["infer"].get("kl", "analytic")}
+    return {}
+
+
+def config_kl(fn=None, sites=None):
+    """
+    Configures the ``kl`` flag in the ``infer`` dict for all sample sites in
+    ``sites`` in a NumPyro model. If ``kl`` is ``analytic``, and ``TraceEnum_ELBO``
+    is being used, an attempt is made to analytically compute the KL divergence
+    in the ELBO at the corresponding site. If ``analytic`` is specified and
+    it is not possible to analytically compute the KL divergence then an error
+    is raised.
+
+    This can be used as either a function::
+
+        model = config_kl(model)
+
+    or as a decorator::
+
+        @config_kl
+        def model(*args, **kwargs):
+            ...
+
+    :param callable fn: Python callable with NumPyro primitives.
+    :param set sites: Sites for which to use analytic KL solution.
+        If ``None`` all sites are set to analytic.
+    """
+    if fn is None:  # support use as a decorator
+        return functools.partial(config_kl, sites=sites)
+
+    return infer_config(fn, functools.partial(_config_kl_fn, sites=sites))
 
 
 def _get_shift(name):
@@ -162,7 +204,7 @@ def _enum_log_density(model, model_args, model_kwargs, params, sum_op, prod_op):
     time_to_init_vars = defaultdict(frozenset)  # PP... variables
     time_to_markov_dims = defaultdict(frozenset)  # dimensions at markov sites
     sum_vars, prod_vars = frozenset(), frozenset()
-    history = 1
+    history = 0
     log_measures = {}
     for site in model_trace.values():
         if site["type"] == "sample":
@@ -178,6 +220,10 @@ def _enum_log_density(model, model_args, model_kwargs, params, sum_op, prod_op):
                 log_prob = scale * log_prob
 
             dim_to_name = site["infer"]["dim_to_name"]
+
+            if all(dim == 1 for dim in log_prob.shape) and dim_to_name == OrderedDict():
+                log_prob = log_prob.squeeze()
+
             log_prob_factor = funsor.to_funsor(
                 log_prob, output=funsor.Real, dim_to_name=dim_to_name
             )
@@ -186,10 +232,15 @@ def _enum_log_density(model, model_args, model_kwargs, params, sum_op, prod_op):
             for dim, name in dim_to_name.items():
                 if name.startswith("_time"):
                     time_dim = funsor.Variable(name, funsor.Bint[log_prob.shape[dim]])
-                    time_to_factors[time_dim].append(log_prob_factor)
                     history = max(
-                        history, max(_get_shift(s) for s in dim_to_name.values())
+                        history,
+                        max(_get_shift(s) for s in dim_to_name.values()),
                     )
+                    if history == 0:
+                        log_factors.append(log_prob_factor)
+                        prod_vars |= frozenset({name})
+                    else:
+                        time_to_factors[time_dim].append(log_prob_factor)
                     time_to_init_vars[time_dim] |= frozenset(
                         s for s in dim_to_name.values() if s.startswith("_PREV_")
                     )
@@ -240,7 +291,8 @@ def _enum_log_density(model, model_args, model_kwargs, params, sum_op, prod_op):
         raise ValueError(
             "Expected the joint log density is a scalar, but got {}. "
             "There seems to be something wrong at the following sites: {}.".format(
-                result.data.shape, {k.split("__BOUND")[0] for k in result.inputs}
+                result.data.shape,
+                {k.split("__BOUND")[0] for k in result.inputs},
             )
         )
     return result, model_trace, log_measures
@@ -268,6 +320,11 @@ def log_density(model, model_args, model_kwargs, params):
     :return: log of joint density and a corresponding model trace
     """
     result, model_trace, _ = _enum_log_density(
-        model, model_args, model_kwargs, params, funsor.ops.logaddexp, funsor.ops.add
+        model,
+        model_args,
+        model_kwargs,
+        params,
+        funsor.ops.logaddexp,
+        funsor.ops.add,
     )
     return result.data, model_trace

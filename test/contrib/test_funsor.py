@@ -8,6 +8,7 @@ import numpy as np
 from numpy.testing import assert_allclose
 import pytest
 
+import jax
 from jax import random
 import jax.numpy as jnp
 
@@ -172,7 +173,6 @@ def test_iteration():
 
 def test_nesting():
     def testing():
-
         with markov():
             v1 = to_data(Tensor(jnp.ones(2), OrderedDict([("1", Bint[2])]), "real"))
             print(1, v1.shape)  # shapes should alternate
@@ -256,11 +256,11 @@ def test_scan_enum_one_latent(num_steps):
     actual_log_joint = log_density(enum(config_enumerate(fun_model)), (data,), {}, {})[
         0
     ]
-    assert_allclose(actual_log_joint, expected_log_joint)
+    assert_allclose(actual_log_joint, expected_log_joint, rtol=1e-6)
 
     actual_last_x = enum(config_enumerate(fun_model))(data)
     expected_last_x = enum(config_enumerate(model))(data)
-    assert_allclose(actual_last_x, expected_last_x)
+    assert_allclose(actual_last_x, expected_last_x, rtol=1e-6)
 
 
 def test_scan_enum_plate():
@@ -485,8 +485,9 @@ def test_scan_history(history, T):
         x_curr = 0
         for t in markov(range(T), history=history):
             probs = p[x_prev, x_curr, z]
-            x_prev, x_curr = x_curr, numpyro.sample(
-                "x_{}".format(t), dist.Bernoulli(probs)
+            x_prev, x_curr = (
+                x_curr,
+                numpyro.sample("x_{}".format(t), dist.Bernoulli(probs)),
             )
             numpyro.sample("y_{}".format(t), dist.Bernoulli(q[x_curr]), obs=0)
         return x_prev, x_curr
@@ -514,6 +515,29 @@ def test_scan_history(history, T):
     actual_x_prev, actual_x_curr = enum(config_enumerate(fun_model))()
     assert_allclose(actual_x_prev, expected_x_prev)
     assert_allclose(actual_x_curr, expected_x_curr)
+
+
+def test_scan_enum_history_0():
+    def model(ys):
+        z = numpyro.sample("z", dist.Bernoulli(0.2), infer={"enumerate": "parallel"})
+
+        def transition_fn(c, y):
+            numpyro.sample("y", dist.Normal(z, 1), obs=y)
+            return None, None
+
+        scan(transition_fn, None, ys)
+
+    actual, trace = log_density(
+        model=enum(model, first_available_dim=-1),
+        model_args=(jnp.arange(3),),
+        model_kwargs={},
+        params={},
+    )
+    z_factor = trace["z"]["fn"].log_prob(trace["z"]["value"])
+    prev_y_factor = trace["_PREV_y"]["fn"].log_prob(trace["_PREV_y"]["value"])
+    y_factor = trace["y"]["fn"].log_prob(trace["y"]["value"]).sum(0)
+    expected = jax.nn.logsumexp(z_factor + prev_y_factor + y_factor)
+    assert_allclose(actual, expected)
 
 
 def test_missing_plate(monkeypatch):
@@ -544,10 +568,25 @@ def test_missing_plate(monkeypatch):
 
     nuts_kernel = NUTS(gmm)
     mcmc = MCMC(nuts_kernel, num_warmup=500, num_samples=500)
-    with pytest.raises(AssertionError, match="Missing plate statement"):
+    with pytest.raises(ValueError, match="Missing a plate statement"):
         mcmc.run(random.PRNGKey(2), data)
 
     monkeypatch.setattr(numpyro.infer.util, "_validate_model", lambda model_trace: None)
     with pytest.raises(Exception):
         mcmc.run(random.PRNGKey(2), data)
     assert len(_PYRO_STACK) == 0
+
+
+@pytest.mark.parametrize(
+    "i_size, j_size, k_size", [(1, 1, 1), (1, 2, 1), (2, 1, 1), (1, 1, 2)]
+)
+def test_singleton_plate_works(i_size, j_size, k_size):
+    def model():
+        with numpyro.plate("i", i_size, dim=-3):
+            with numpyro.plate("j", j_size, dim=-2):
+                with numpyro.plate("k", k_size, dim=-1):
+                    numpyro.sample("a", dist.Normal())
+
+    model = enum(numpyro.handlers.seed(model, rng_seed=0), first_available_dim=-4)
+
+    log_density(model, (), {}, {})

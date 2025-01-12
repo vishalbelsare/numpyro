@@ -8,11 +8,14 @@ from numpy.testing import assert_allclose
 import pytest
 import scipy
 
+import jax
 from jax import lax, random, vmap
 import jax.numpy as jnp
 from jax.scipy.special import expit, xlog1py, xlogy
 
+import numpyro.distributions as dist
 from numpyro.distributions.util import (
+    add_diag,
     binary_cross_entropy_with_logits,
     binomial,
     categorical,
@@ -33,10 +36,10 @@ def test_binary_cross_entropy_with_logits(x, y):
 
 @pytest.mark.parametrize("prim", [xlogy, xlog1py])
 def test_binop_batch_rule(prim):
-    bx = jnp.array([1.0, 2.0, 3.0])
-    by = jnp.array([2.0, 3.0, 4.0])
-    x = jnp.array(1.0)
-    y = jnp.array(2.0)
+    bx = np.array([1.0, 2.0, 3.0])
+    by = np.array([2.0, 3.0, 4.0])
+    x = np.array(1.0)
+    y = np.array(2.0)
 
     actual_bx_by = vmap(lambda x, y: prim(x, y))(bx, by)
     for i in range(3):
@@ -66,7 +69,7 @@ def test_categorical_shape(p, shape):
     assert jnp.shape(categorical(rng_key, p, shape)) == expected_shape
 
 
-@pytest.mark.parametrize("p", [jnp.array([0.2, 0.3, 0.5]), jnp.array([0.8, 0.1, 0.1])])
+@pytest.mark.parametrize("p", [np.array([0.2, 0.3, 0.5]), np.array([0.8, 0.1, 0.1])])
 def test_categorical_stats(p):
     rng_key = random.PRNGKey(0)
     n = 10000
@@ -97,7 +100,7 @@ def test_multinomial_inhomogeneous(n, device_array):
     if device_array:
         n = jnp.asarray(n)
 
-    p = jnp.array([0.5, 0.5])
+    p = np.array([0.5, 0.5])
     x = multinomial(random.PRNGKey(0), p, n)
     assert x.shape == jnp.shape(n) + jnp.shape(p)
     assert_allclose(x.sum(-1), n)
@@ -164,3 +167,62 @@ def test_safe_normalize(dim):
     data = jnp.zeros((10, dim))
     x = safe_normalize(data)
     assert_allclose((x * x).sum(-1), jnp.ones(x.shape[:-1]), rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "matrix_shape, diag_shape",
+    [
+        ((5, 5), ()),
+        ((7, 7), (7,)),
+        ((10, 3, 3), (10, 3)),
+        ((7, 5, 9, 9), (5, 1)),
+    ],
+)
+def test_add_diag(matrix_shape: tuple, diag_shape: tuple) -> None:
+    matrix = random.normal(random.key(0), matrix_shape)
+    diag = random.normal(random.key(1), diag_shape)
+    expected = matrix + diag[..., None] * jnp.eye(matrix.shape[-1])
+    actual = add_diag(matrix, diag)
+    np.testing.assert_allclose(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "my_dist",
+    [
+        dist.TruncatedNormal(low=-1.0, high=2.0),
+        dist.TruncatedCauchy(low=-5, high=10),
+        dist.TruncatedDistribution(dist.StudentT(3), low=1.5),
+    ],
+)
+def test_no_tracer_leak_at_lazy_property_log_prob(my_dist):
+    """
+    Tests that truncated distributions, which use @lazy_property
+    values in their log_prob() methods, do not
+    have tracer leakage when log_prob() is called.
+    Reference: https://github.com/pyro-ppl/numpyro/issues/1836, and
+    https://github.com/CDCgov/multisignal-epi-inference/issues/282
+    """
+    jit_lp = jax.jit(my_dist.log_prob)
+    with jax.check_tracer_leaks():
+        jit_lp(1.0)
+
+
+@pytest.mark.parametrize(
+    "my_dist",
+    [
+        dist.TruncatedNormal(low=-1.0, high=2.0),
+        dist.TruncatedCauchy(low=-5, high=10),
+        dist.TruncatedDistribution(dist.StudentT(3), low=1.5),
+    ],
+)
+def test_no_tracer_leak_at_lazy_property_sample(my_dist):
+    """
+    Tests that truncated distributions, which use @lazy_property
+    values in their sample() methods, do not
+    have tracer leakage when sample() is called.
+    Reference: https://github.com/pyro-ppl/numpyro/issues/1836, and
+    https://github.com/CDCgov/multisignal-epi-inference/issues/282
+    """
+    jit_sample = jax.jit(my_dist.sample)
+    with jax.check_tracer_leaks():
+        jit_sample(jax.random.key(5))

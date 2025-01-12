@@ -7,7 +7,6 @@ import shutil
 import sys
 
 import nbsphinx
-import sphinx_rtd_theme
 
 # import pkg_resources
 
@@ -35,21 +34,24 @@ from numpyro.infer.hmc import hmc  # noqa: E402
 
 hmc(None, None)
 
+autodoc_mock_imports = ["jaxns"]
+
 # -- Project information -----------------------------------------------------
 
-project = u"NumPyro"
-copyright = u"2019, Uber Technologies, Inc"
-author = u"Uber AI Labs"
+project = "NumPyro"
+copyright = "2019, Uber Technologies, Inc"
+author = "Uber AI Labs"
 
 version = ""
 
 if "READTHEDOCS" not in os.environ:
     # if developing locally, use numpyro.__version__ as version
-    from numpyro import __version__  # noqaE402
+    from numpyro import __version__  # noqa: E402
 
     version = __version__
 
-    html_context = {"github_version": "master"}
+    # Add "Edit on GitHub" button on the upper right corner of local docs.
+    html_context = {"github_version": "master", "display_github": True}
 
 # release version
 release = version
@@ -66,6 +68,7 @@ release = version
 # ones.
 extensions = [
     "nbsphinx",
+    "sphinxcontrib.jquery",
     "sphinx.ext.autodoc",
     "sphinx.ext.doctest",
     "sphinx.ext.imgconverter",
@@ -112,7 +115,7 @@ master_doc = "index"
 #
 # This is also used if you do content translation via gettext catalogs.
 # Usually you set "language" from the command line for these cases.
-language = None
+language = "en"
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
@@ -225,7 +228,6 @@ html_favicon = "_static/img/favicon/favicon.ico"
 # a list of builtin themes.
 #
 html_theme = "sphinx_rtd_theme"
-html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
 
 # Theme options are theme-specific and customize the look and feel of a theme
 # further.  For a list of options available for each theme, see the
@@ -280,14 +282,14 @@ latex_elements = {
 # (source start file, target name, title,
 #  author, documentclass [howto, manual, or own class]).
 latex_documents = [
-    (master_doc, "NumPyro.tex", u"NumPyro Documentation", u"Uber AI Labs", "manual")
+    (master_doc, "NumPyro.tex", "NumPyro Documentation", "Uber AI Labs", "manual")
 ]
 
 # -- Options for manual page output ------------------------------------------
 
 # One entry per manual page. List of tuples
 # (source start file, name, description, authors, manual section).
-man_pages = [(master_doc, "NumPyro", u"NumPyro Documentation", [author], 1)]
+man_pages = [(master_doc, "NumPyro", "NumPyro Documentation", [author], 1)]
 
 # -- Options for Texinfo output ----------------------------------------------
 
@@ -298,7 +300,7 @@ texinfo_documents = [
     (
         master_doc,
         "NumPyro",
-        u"NumPyro Documentation",
+        "NumPyro Documentation",
         author,
         "NumPyro",
         "Pyro PPL on Numpy",
@@ -314,7 +316,12 @@ texinfo_documents = [
 # Example configuration for intersphinx: refer to the Python standard library.
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3/", None),
-    "numpy": ("http://docs.scipy.org/doc/numpy/", None),
+    "numpy": ("https://numpy.org/doc/stable/", None),
     "jax": ("https://jax.readthedocs.io/en/latest/", None),
-    "pyro": ("http://docs.pyro.ai/en/stable/", None),
+    "pyro": ("https://docs.pyro.ai/en/stable/", None),
 }
+
+
+# -- Suppress warnings in Sphinx 7.3.5
+
+suppress_warnings = ["config.cache"]

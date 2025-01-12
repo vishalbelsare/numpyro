@@ -3,7 +3,11 @@
 
 from abc import ABC, abstractmethod
 import math
+from typing import Iterable
 
+import numpy as np
+
+import jax
 import jax.numpy as jnp
 
 import numpyro
@@ -11,6 +15,7 @@ import numpyro.distributions as dist
 from numpyro.distributions import biject_to, constraints
 from numpyro.distributions.util import is_identically_one, safe_normalize, sum_rightmost
 from numpyro.infer.autoguide import AutoContinuous
+from numpyro.util import not_jax_tracer
 
 
 class Reparam(ABC):
@@ -69,7 +74,9 @@ class LocScaleReparam(Reparam):
        Maria I. Gorinova, Dave Moore, Matthew D. Hoffman (2019)
 
     :param float centered: optional centered parameter. If None (default) learn
-        a per-site per-element centering parameter in ``[0,1]``. If 0, fully
+        a per-site per-element centering parameter in ``[0,1]`` initialized at value 0.5.
+        To sample the parameter, consider using :class:`~numpyro.handlers.lift` handler with a
+        prior like ``Uniform(0, 1)`` to cast the parameter to a latent variable. If 0, fully
         decenter the distribution; if 1, preserve the centered distribution
         unchanged.
     :param shape_params: list of additional parameter names to copy unchanged from
@@ -78,16 +85,33 @@ class LocScaleReparam(Reparam):
     """
 
     def __init__(self, centered=None, shape_params=()):
-        assert centered is None or isinstance(centered, (int, float))
+        assert centered is None or isinstance(
+            centered, (int, float, np.generic, np.ndarray, jnp.ndarray, jax.core.Tracer)
+        )
         assert isinstance(shape_params, (tuple, list))
         assert all(isinstance(name, str) for name in shape_params)
-        if isinstance(centered, (int, float)):
-            assert 0 <= centered and centered <= 1
+        if centered is not None:
+            is_valid = constraints.unit_interval.check(centered)
+            if not_jax_tracer(is_valid):
+                if not np.all(is_valid):
+                    raise ValueError(
+                        "`centered` argument does not satisfy `0 <= centered <= 1`."
+                    )
+
         self.centered = centered
         self.shape_params = shape_params
 
     def __call__(self, name, fn, obs):
         assert obs is None, "LocScaleReparam does not support observe statements"
+        support = fn.support
+        if isinstance(support, constraints.independent):
+            support = fn.support.base_constraint
+        if support is not constraints.real:
+            raise ValueError(
+                "LocScaleReparam only supports distributions with real "
+                f"support, but got {support} support at site {name}."
+            )
+
         centered = self.centered
         if is_identically_one(centered):
             return fn, obs
@@ -102,8 +126,12 @@ class LocScaleReparam(Reparam):
                 jnp.full(event_shape, 0.5),
                 constraint=constraints.unit_interval,
             )
-        params["loc"] = fn.loc * centered
-        params["scale"] = fn.scale ** centered
+        if isinstance(centered, (int, float, np.generic)) and centered == 0.0:
+            params["loc"] = jnp.zeros_like(fn.loc)
+            params["scale"] = jnp.ones_like(fn.scale)
+        else:
+            params["loc"] = fn.loc * centered
+            params["scale"] = fn.scale**centered
         decentered_fn = self._wrap(type(fn)(**params), expand_shape, event_dim)
 
         # Draw decentered noise.
@@ -132,14 +160,13 @@ class TransformReparam(Reparam):
     def __call__(self, name, fn, obs):
         assert obs is None, "TransformReparam does not support observe statements"
         fn, expand_shape, event_dim = self._unwrap(fn)
-        if isinstance(fn, (dist.Uniform, dist.TruncatedCauchy, dist.TruncatedNormal)):
+        if not isinstance(fn, dist.TransformedDistribution):
             raise ValueError(
                 "TransformReparam does not automatically work with {}"
                 " distribution anymore. Please explicitly using"
                 " TransformedDistribution(base_dist, AffineTransform(...)) pattern"
                 " with TransformReparam.".format(type(fn).__name__)
             )
-        assert isinstance(fn, dist.TransformedDistribution)
 
         # Draw noise from the base distribution.
         base_event_dim = event_dim
@@ -188,7 +215,7 @@ class NeuTraReparam(Reparam):
     """
     Neural Transport reparameterizer [1] of multiple latent variables.
 
-    This uses a trained :class:`~pyro.contrib.autoguide.AutoContinuous`
+    This uses a trained :class:`~numpyro.infer.autoguide.AutoContinuous`
     guide to alter the geometry of a model, typically for use e.g. in MCMC.
     Example usage::
 
@@ -199,7 +226,7 @@ class NeuTraReparam(Reparam):
 
         # Step 2. Use trained guide in NeuTra MCMC
         neutra = NeuTraReparam(guide)
-        model = netra.reparam(model)
+        model = neutra.reparam(model)
         nuts = NUTS(model)
         # ...now use the model in HMC or NUTS...
 
@@ -235,10 +262,12 @@ class NeuTraReparam(Reparam):
         self._x_unconstrained = {}
 
     def _reparam_config(self, site):
-        if site["name"] in self.guide.prototype_trace and not site.get(
-            "is_observed", False
-        ):
-            return self
+        if site["name"] in self.guide.prototype_trace:
+            # We only reparam if this is an unobserved site in the guide
+            # prototype trace.
+            guide_site = self.guide.prototype_trace[site["name"]]
+            if not guide_site.get("is_observed", False):
+                return self
 
     def reparam(self, fn=None):
         return numpyro.handlers.reparam(fn, config=self._reparam_config)
@@ -252,9 +281,15 @@ class NeuTraReparam(Reparam):
         compute_density = numpyro.get_mask() is not False
         if not self._x_unconstrained:  # On first sample site.
             # Sample a shared latent.
+            model_plates = {
+                msg["name"]
+                for msg in self.guide.prototype_trace.values()
+                if msg["type"] == "plate"
+            }
             z_unconstrained = numpyro.sample(
                 "{}_shared_latent".format(self.guide.prefix),
                 self.guide.get_base_dist().mask(False),
+                infer={"block_plates": model_plates},
             )
 
             # Differentiably transform.
@@ -303,6 +338,7 @@ class CircularReparam(Reparam):
         if isinstance(support, constraints.independent):
             support = fn.support.base_constraint
         assert support is constraints.circular
+        assert obs is None, "CircularReparam does not support observe statements"
 
         # Draw parameter-free noise.
         new_fn = dist.ImproperUniform(constraints.real, fn.batch_shape, fn.event_shape)
@@ -318,3 +354,49 @@ class CircularReparam(Reparam):
         # Simulate a pyro.deterministic() site.
         numpyro.factor(f"{name}_factor", fn.log_prob(value))
         return None, value
+
+
+class ExplicitReparam(Reparam):
+    """
+    Explicit reparametrizer of a latent variable :code:`x` to a transformed space
+    :code:`y = transform(x)` with more amenable geometry. This reparametrizer is similar
+    to :class:`.TransformReparam` but allows reparametrizations to be decoupled from the
+    model declaration.
+
+    :param transform: Bijective transform to the reparameterized space.
+
+    **Example:**
+
+    .. doctest::
+
+        >>> from jax import random
+        >>> from jax import numpy as jnp
+        >>> import numpyro
+        >>> from numpyro import handlers, distributions as dist
+        >>> from numpyro.infer import MCMC, NUTS
+        >>> from numpyro.infer.reparam import ExplicitReparam
+        >>>
+        >>> def model():
+        ...    numpyro.sample("x", dist.Gamma(4, 4))
+        >>>
+        >>> # Sample in unconstrained space using a soft-plus instead of exp transform.
+        >>> reparam = ExplicitReparam(dist.transforms.SoftplusTransform().inv)
+        >>> reparametrized = handlers.reparam(model, {"x": reparam})
+        >>> kernel = NUTS(model=reparametrized)
+        >>> mcmc = MCMC(kernel, num_warmup=1000, num_samples=1000, num_chains=1)
+        >>> mcmc.run(random.PRNGKey(2))  # doctest: +SKIP
+        sample: 100%|██████████| 2000/2000 [00:00<00:00, 2306.47it/s, 3 steps of size 9.65e-01. acc. prob=0.93]
+    """
+
+    def __init__(self, transform):
+        if isinstance(transform, Iterable) and all(
+            isinstance(t, dist.transforms.Transform) for t in transform
+        ):
+            transform = dist.transforms.ComposeTransform(transform)
+        self.transform = transform
+
+    def __call__(self, name, fn, obs):
+        assert obs is None, "ExplicitReparam does not support observe statements"
+        transformed = dist.TransformedDistribution(fn, self.transform)
+        x = numpyro.sample(f"{name}_base", transformed)
+        return None, self.transform.inv(x)

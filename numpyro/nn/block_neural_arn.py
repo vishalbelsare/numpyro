@@ -3,16 +3,8 @@
 
 import numpy as np
 
-import jax
 from jax import random
-
-from numpyro.util import _versiontuple
-
-if _versiontuple(jax.__version__) >= (0, 2, 25):
-    from jax.example_libraries import stax
-else:
-    from jax.experimental import stax
-
+from jax.example_libraries import stax
 from jax.nn import sigmoid, softplus
 from jax.nn.initializers import glorot_uniform, normal, uniform
 import jax.numpy as jnp
@@ -122,6 +114,32 @@ def Tanh():
     return init_fun, apply_fun
 
 
+def LeakyTanh(min_grad: float = 0.01):
+    """
+    Leaky Tanh nonlinearity :math:`y=\text{tanh}(x) + cx` with its log-Jacobian.
+
+    This choice when used in ``BlockNeuralAutoregressiveNN`` ensures the image of the
+    transformation is the set of real values (unlike ``Tanh``).
+
+    :param float min_grad: The minimum gradient value (:math:`c` above). Defaults to 0.01.
+    :return: an (`init_fn`, `apply_fn`) pair.
+    """
+
+    def init_fun(rng, input_shape):
+        return input_shape, ()
+
+    def apply_fun(params, inputs, **kwargs):
+        x, logdet = inputs
+        out = jnp.tanh(x) + min_grad * x  # ensure grad at least 0.01.
+        tanh_logdet = -2 * (x + softplus(-2 * x) - jnp.log(2.0))
+        act_logdet = jnp.logaddexp(tanh_logdet, jnp.log(min_grad))
+        # Reshape to match logdet shape
+        act_logdet = act_logdet.reshape(logdet.shape[:-2] + (1, logdet.shape[-1]))
+        return out, logdet + act_logdet
+
+    return init_fun, apply_fun
+
+
 def FanInResidualNormal():
     """
     Similar to stax.FanInSum but also keeps track of log determinant of Jacobian.
@@ -164,9 +182,18 @@ def FanInResidualGated(gate_init=normal(1.0)):
     return init_fun, apply_fun
 
 
-def BlockNeuralAutoregressiveNN(input_dim, hidden_factors=[8, 8], residual=None):
+def BlockNeuralAutoregressiveNN(
+    input_dim,
+    hidden_factors=[8, 8],
+    residual=None,
+    activation=None,
+):
     """
     An implementation of Block Neural Autoregressive neural network.
+
+    In contrast to the original paper, by default, we use ``LeakyTanh`` as the
+    activation, defined as :math:`y=Tanh(x) + cx` with :math:`c` being a small constant
+    (default to 0.01), which ensures the transform maps from real -> real.
 
     **References**
 
@@ -178,13 +205,15 @@ def BlockNeuralAutoregressiveNN(input_dim, hidden_factors=[8, 8], residual=None)
         input dimension. This corresponds to both :math:`a` and :math:`b` in reference [1].
         The elements of hidden_factors must be integers.
     :param str residual: Type of residual connections to use. One of `None`, `"normal"`, `"gated"`.
+    :param tuple activation: An (`init_fn`, `update_fn`) pair. Defaults to ``LeakyTanh``.
     :return: an (`init_fn`, `update_fn`) pair.
     """
     layers = []
     in_factor = 1
+    activation = LeakyTanh() if activation is None else activation
     for hidden_factor in hidden_factors:
         layers.append(BlockMaskedDense(input_dim, in_factor, hidden_factor))
-        layers.append(Tanh())
+        layers.append(activation)
         in_factor = hidden_factor
     layers.append(BlockMaskedDense(input_dim, in_factor, 1))
     arn = stax.serial(*layers)

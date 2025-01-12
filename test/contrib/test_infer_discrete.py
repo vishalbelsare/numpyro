@@ -51,7 +51,6 @@ def log_prob_sum(trace):
 @pytest.mark.parametrize("length", [1, 2, 10])
 @pytest.mark.parametrize("temperature", [0, 1])
 def test_hmm_smoke(length, temperature):
-
     # This should match the example in the infer_discrete docstring.
     def hmm(data, hidden_dim=10):
         transition = 0.3 / hidden_dim + 0.7 * jnp.eye(hidden_dim)
@@ -97,7 +96,6 @@ def test_hmm_smoke(length, temperature):
 )
 @pytest.mark.parametrize("temperature", [0, 1])
 def test_scan_hmm_smoke(length, temperature):
-
     # This should match the example in the infer_discrete docstring.
     def hmm(data, hidden_dim=10):
         transition = 0.3 / hidden_dim + 0.7 * jnp.eye(hidden_dim)
@@ -387,7 +385,6 @@ def model_zzxx():
 
 
 def model2():
-
     data = [np.array([-1.0, -1.0, 0.0]), np.array([-1.0, 1.0])]
     p = numpyro.param("p", np.array([0.25, 0.75]))
     loc = numpyro.sample("loc", dist.Normal(0, 1).expand([2]).to_event(1))
@@ -411,7 +408,7 @@ def test_mcmc_model_side_enumeration(model, temperature):
         k: v[0] for k, v in mcmc.get_samples().items() if k in ["loc", "scale"]
     }
 
-    # MAP estimate discretes, conditioned on posterior sampled continous latents.
+    # MAP estimate discrete, conditioned on posterior sampled continuous latents.
     model = handlers.seed(model, rng_seed=1)
     actual_trace = handlers.trace(
         infer_discrete(
@@ -454,7 +451,7 @@ def test_distribution_masked(temperature):
     )
     sampled_trace = handlers.trace(sampled_model).get_trace()
     conditioned_traces = {
-        z: handlers.trace(model).get_trace(z=np.array(z)) for z in [0.0, 1.0]
+        z: handlers.trace(model).get_trace(z=np.array(z)) for z in [0, 1]
     }
 
     # Check  posterior over z.

@@ -74,7 +74,7 @@ class MixedHMC(DiscreteHMCGibbs):
         *,
         num_discrete_updates=None,
         random_walk=False,
-        modified=False
+        modified=False,
     ):
         super().__init__(inner_kernel, random_walk=random_walk, modified=modified)
         if inner_kernel._algo == "NUTS":
@@ -104,7 +104,7 @@ class MixedHMC(DiscreteHMCGibbs):
             find_reasonable_step_size=None,
         )
 
-        # In HMC, when `hmc_state.r` is not None, we will skip drawing a random momemtum at the
+        # In HMC, when `hmc_state.r` is not None, we will skip drawing a random momentum at the
         # beginning of an HMC step. The reason is we need to maintain `r` between each sub-trajectories.
         r = momentum_generator(
             state.hmc_state.z, state.hmc_state.adapt_state.mass_matrix_sqrt, rng_r
@@ -263,7 +263,7 @@ class MixedHMC(DiscreteHMCGibbs):
         # Algo 1, line 11: perform MH correction
         delta_energy = energy_new - energy_old - delta_pe_sum
         delta_energy = jnp.where(jnp.isnan(delta_energy), jnp.inf, delta_energy)
-        accept_prob = jnp.clip(jnp.exp(-delta_energy), a_max=1.0)
+        accept_prob = jnp.clip(jnp.exp(-delta_energy), None, 1.0)
 
         # record the correct new num_steps
         hmc_state = hmc_state._replace(num_steps=hmc_state_new.num_steps)
@@ -307,4 +307,6 @@ class MixedHMC(DiscreteHMCGibbs):
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_wa_update"] = None
+        state["_prototype_trace"] = None
+        state["_support_sizes_flat"] = None
         return state

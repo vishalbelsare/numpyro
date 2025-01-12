@@ -7,22 +7,19 @@ import numpy as np
 from numpy.testing import assert_allclose
 import pytest
 
-import jax
 from jax import jacfwd, random
+from jax.example_libraries import stax
+import jax.numpy as jnp
+import jax.random as jr
 
-from numpyro.util import _versiontuple
-
-if _versiontuple(jax.__version__) >= (0, 2, 25):
-    from jax.example_libraries import stax
-else:
-    from jax.experimental import stax
-
+from numpyro.distributions import Normal, TransformedDistribution
 from numpyro.distributions.flows import (
     BlockNeuralAutoregressiveTransform,
     InverseAutoregressiveTransform,
 )
 from numpyro.distributions.util import matrix_to_tril_vec
 from numpyro.nn import AutoregressiveNN, BlockNeuralAutoregressiveNN
+from numpyro.nn.block_neural_arn import LeakyTanh, Tanh
 
 
 def _make_iaf_args(input_dim, hidden_dims):
@@ -41,8 +38,12 @@ def _make_iaf_args(input_dim, hidden_dims):
     return (partial(arn, init_params),)
 
 
-def _make_bnaf_args(input_dim, hidden_factors):
-    arn_init, arn = BlockNeuralAutoregressiveNN(input_dim, hidden_factors)
+def _make_bnaf_args(input_dim, hidden_factors, activation):
+    arn_init, arn = BlockNeuralAutoregressiveNN(
+        input_dim,
+        hidden_factors,
+        activation=activation,
+    )
     _, rng_key_perm = random.split(random.PRNGKey(0))
     _, init_params = arn_init(random.PRNGKey(0), (input_dim,))
     return (partial(arn, init_params),)
@@ -53,10 +54,24 @@ def _make_bnaf_args(input_dim, hidden_factors):
     [
         (InverseAutoregressiveTransform, _make_iaf_args(5, hidden_dims=[10]), 5),
         (InverseAutoregressiveTransform, _make_iaf_args(7, hidden_dims=[8, 9]), 7),
-        (BlockNeuralAutoregressiveTransform, _make_bnaf_args(7, hidden_factors=[4]), 7),
         (
             BlockNeuralAutoregressiveTransform,
-            _make_bnaf_args(7, hidden_factors=[2, 3]),
+            _make_bnaf_args(7, hidden_factors=[4], activation=LeakyTanh()),
+            7,
+        ),
+        (
+            BlockNeuralAutoregressiveTransform,
+            _make_bnaf_args(7, hidden_factors=[2, 3], activation=LeakyTanh()),
+            7,
+        ),
+        (
+            BlockNeuralAutoregressiveTransform,
+            _make_bnaf_args(7, hidden_factors=[4], activation=Tanh()),
+            7,
+        ),
+        (
+            BlockNeuralAutoregressiveTransform,
+            _make_bnaf_args(7, hidden_factors=[2, 3], activation=Tanh()),
             7,
         ),
     ],
@@ -98,3 +113,21 @@ def test_flows(flow_class, flow_args, input_dim, batch_shape):
 
         assert np.sum(np.abs(np.triu(jac, 1))) == 0.00
         assert np.all(np.abs(matrix_to_tril_vec(jac)) > 0)
+
+
+def test_bnaf_normalization():
+    dim = (1,)
+    x = jnp.linspace(-1000, 1000, 5000)[:, None]
+
+    init_fn, apply_fn = BlockNeuralAutoregressiveNN(dim[0], activation=LeakyTanh(0.1))
+    params = init_fn(jr.PRNGKey(0), (1,))[1]
+    arn = partial(apply_fn, params)
+    bnaf = BlockNeuralAutoregressiveTransform(arn)
+    dist = TransformedDistribution(Normal(jnp.zeros(dim), 0.5), bnaf.inv)
+    probs = jnp.exp(dist.log_prob(x))
+    probs, x = jnp.squeeze(probs), jnp.squeeze(x)
+
+    # Rough integral
+    integral = jnp.trapezoid(probs, x)
+    assert integral > 0.9
+    assert integral < 1.1

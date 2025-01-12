@@ -1,29 +1,23 @@
 # Copyright Contributors to the Pyro project.
 # SPDX-License-Identifier: Apache-2.0
 
-from functools import namedtuple, partial
+from collections import namedtuple
+from functools import partial
 import warnings
 
 import tqdm
 
 import jax
-
-from numpyro.util import _versiontuple
-
-if _versiontuple(jax.__version__) >= (0, 2, 25):
-    from jax.example_libraries import optimizers
-else:
-    from jax.experimental import optimizers
-
 from jax import jit, lax, random
+from jax.example_libraries import optimizers
 import jax.numpy as jnp
-from jax.tree_util import tree_map
 
 from numpyro.distributions import constraints
 from numpyro.distributions.transforms import biject_to
-from numpyro.handlers import replay, seed, trace
+from numpyro.handlers import replay, seed, substitute, trace
 from numpyro.infer.util import helpful_support_errors, transform_fn
-from numpyro.optim import _NumPyroOptim
+from numpyro.optim import _NumPyroOptim, optax_to_numpyro
+from numpyro.util import find_stack_level
 
 SVIState = namedtuple("SVIState", ["optim_state", "mutable_state", "rng_key"])
 """
@@ -38,7 +32,7 @@ SVIRunResult = namedtuple("SVIRunResult", ["params", "state", "losses"])
 """
 A :func:`~collections.namedtuple` consisting of the following fields:
  - **params** - the optimized parameters.
- - **state** - the last :class:`SVIState`
+ - **state** - the last :data:`SVIState`
  - **losses** - the losses collected at every step.
 """
 
@@ -95,7 +89,7 @@ class SVI(object):
 
         >>> def model(data):
         ...     f = numpyro.sample("latent_fairness", dist.Beta(10, 10))
-        ...     with numpyro.plate("N", data.shape[0]):
+        ...     with numpyro.plate("N", data.shape[0] if data is not None else 10):
         ...         numpyro.sample("obs", dist.Bernoulli(f), obs=data)
 
         >>> def guide(data):
@@ -110,9 +104,15 @@ class SVI(object):
         >>> svi_result = svi.run(random.PRNGKey(0), 2000, data)
         >>> params = svi_result.params
         >>> inferred_mean = params["alpha_q"] / (params["alpha_q"] + params["beta_q"])
+        >>> # use guide to make predictive
+        >>> predictive = Predictive(model, guide=guide, params=params, num_samples=1000)
+        >>> samples = predictive(random.PRNGKey(1), data=None)
         >>> # get posterior samples
         >>> predictive = Predictive(guide, params=params, num_samples=1000)
-        >>> samples = predictive(random.PRNGKey(1), data)
+        >>> posterior_samples = predictive(random.PRNGKey(1), data=None)
+        >>> # use posterior samples to make predictive
+        >>> predictive = Predictive(model, posterior_samples, params=params, num_samples=1000)
+        >>> samples = predictive(random.PRNGKey(1), data=None)
 
     :param model: Python callable with Pyro primitives for the model.
     :param guide: Python callable with Pyro primitives for the guide
@@ -120,7 +120,7 @@ class SVI(object):
     :param optim: An instance of :class:`~numpyro.optim._NumpyroOptim`, a
         ``jax.example_libraries.optimizers.Optimizer`` or an Optax
         ``GradientTransformation``. If you pass an Optax optimizer it will
-        automatically be wrapped using :func:`numpyro.contrib.optim.optax_to_numpyro`.
+        automatically be wrapped using :func:`numpyro.optim.optax_to_numpyro`.
 
             >>> from optax import adam, chain, clip
             >>> svi = SVI(model, guide, chain(clip(10.0), adam(1e-3)), loss=Trace_ELBO())
@@ -145,8 +145,6 @@ class SVI(object):
         else:
             try:
                 import optax
-
-                from numpyro.contrib.optim import optax_to_numpyro
             except ImportError:
                 raise ImportError(
                     "It looks like you tried to use an optimizer that isn't an "
@@ -165,13 +163,15 @@ class SVI(object):
 
             self.optim = optax_to_numpyro(optim)
 
-    def init(self, rng_key, *args, **kwargs):
+    def init(self, rng_key, *args, init_params=None, **kwargs):
         """
         Gets the initial SVI state.
 
         :param jax.random.PRNGKey rng_key: random number generator seed.
         :param args: arguments to the model / guide (these can possibly vary during
             the course of fitting).
+        :param dict init_params: if not None, initialize :class:`numpyro.param` sites with values from
+            this dictionary instead of using ``init_value`` in :class:`numpyro.param` primitives.
         :param kwargs: keyword arguments to the model / guide (these can possibly vary
             during the course of fitting).
         :return: the initial :data:`SVIState`
@@ -179,10 +179,36 @@ class SVI(object):
         rng_key, model_seed, guide_seed = random.split(rng_key, 3)
         model_init = seed(self.model, model_seed)
         guide_init = seed(self.guide, guide_seed)
+        if init_params is not None:
+            guide_init = substitute(guide_init, init_params)
         guide_trace = trace(guide_init).get_trace(*args, **kwargs, **self.static_kwargs)
-        model_trace = trace(replay(model_init, guide_trace)).get_trace(
-            *args, **kwargs, **self.static_kwargs
-        )
+        init_guide_params = {
+            name: site["value"]
+            for name, site in guide_trace.items()
+            if site["type"] == "param"
+        }
+        if init_params is not None:
+            init_guide_params.update(init_params)
+        if getattr(self.loss, "multi_sample_guide", False):
+            latents = {
+                name: site["value"][0]
+                for name, site in guide_trace.items()
+                if site["type"] == "sample" and site["value"].size > 0
+            }
+            latents.update(init_guide_params)
+            with trace() as model_trace, substitute(data=latents):
+                model_init(*args, **kwargs, **self.static_kwargs)
+            for site in model_trace.values():
+                if site["type"] == "mutable":
+                    raise ValueError(
+                        "mutable state in model is not supported for "
+                        "multi-sample guide."
+                    )
+        else:
+            model_trace = trace(
+                substitute(replay(model_init, guide_trace), init_guide_params)
+            ).get_trace(*args, **kwargs, **self.static_kwargs)
+
         params = {}
         inv_transforms = {}
         mutable_state = {}
@@ -204,7 +230,8 @@ class SVI(object):
             ):
                 s_name = type(self.loss).__name__
                 warnings.warn(
-                    f"Currently, SVI with {s_name} loss does not support models with discrete latent variables"
+                    f"Currently, SVI with {s_name} loss does not support models with discrete latent variables",
+                    stacklevel=find_stack_level(),
                 )
 
         if not mutable_state:
@@ -212,7 +239,7 @@ class SVI(object):
         self.constrain_fn = partial(transform_fn, inv_transforms)
         # we convert weak types like float to float32/float64
         # to avoid recompiling body_fn in svi.run
-        params, mutable_state = tree_map(
+        params, mutable_state = jax.tree.map(
             lambda x: lax.convert_element_type(x, jnp.result_type(x)),
             (params, mutable_state),
         )
@@ -228,7 +255,7 @@ class SVI(object):
         params = self.constrain_fn(self.optim.get_params(svi_state.optim_state))
         return params
 
-    def update(self, svi_state, *args, **kwargs):
+    def update(self, svi_state, *args, forward_mode_differentiation=False, **kwargs):
         """
         Take a single step of SVI (possibly on a batch / minibatch of data),
         using the optimizer.
@@ -236,6 +263,8 @@ class SVI(object):
         :param svi_state: current state of SVI.
         :param args: arguments to the model / guide (these can possibly vary during
             the course of fitting).
+        :param forward_mode_differentiation: boolean flag indicating whether to use forward mode differentiation.
+            Defaults to False.
         :param kwargs: keyword arguments to the model / guide (these can possibly vary
             during the course of fitting).
         :return: tuple of `(svi_state, loss)`.
@@ -253,11 +282,15 @@ class SVI(object):
             mutable_state=svi_state.mutable_state,
         )
         (loss_val, mutable_state), optim_state = self.optim.eval_and_update(
-            loss_fn, svi_state.optim_state
+            loss_fn,
+            svi_state.optim_state,
+            forward_mode_differentiation=forward_mode_differentiation,
         )
         return SVIState(optim_state, mutable_state, rng_key), loss_val
 
-    def stable_update(self, svi_state, *args, **kwargs):
+    def stable_update(
+        self, svi_state, *args, forward_mode_differentiation=False, **kwargs
+    ):
         """
         Similar to :meth:`update` but returns the current state if the
         the loss or the new state contains invalid values.
@@ -265,6 +298,8 @@ class SVI(object):
         :param svi_state: current state of SVI.
         :param args: arguments to the model / guide (these can possibly vary during
             the course of fitting).
+        :param forward_mode_differentiation: boolean flag indicating whether to use forward mode differentiation.
+            Defaults to False.
         :param kwargs: keyword arguments to the model / guide (these can possibly vary
             during the course of fitting).
         :return: tuple of `(svi_state, loss)`.
@@ -282,7 +317,9 @@ class SVI(object):
             mutable_state=svi_state.mutable_state,
         )
         (loss_val, mutable_state), optim_state = self.optim.eval_and_stable_update(
-            loss_fn, svi_state.optim_state
+            loss_fn,
+            svi_state.optim_state,
+            forward_mode_differentiation=forward_mode_differentiation,
         )
         return SVIState(optim_state, mutable_state, rng_key), loss_val
 
@@ -293,7 +330,9 @@ class SVI(object):
         *args,
         progress_bar=True,
         stable_update=False,
+        forward_mode_differentiation=False,
         init_state=None,
+        init_params=None,
         **kwargs,
     ):
         """
@@ -313,6 +352,13 @@ class SVI(object):
             ``True``.
         :param bool stable_update: whether to use :meth:`stable_update` to update
             the state. Defaults to False.
+        :param bool forward_mode_differentiation: whether to use forward-mode differentiation
+            or reverse-mode differentiation. By default, we use reverse mode but the forward
+            mode can be useful in some cases to improve the performance. In addition, some
+            control flow utility on JAX such as `jax.lax.while_loop` or `jax.lax.fori_loop`
+            only supports forward-mode differentiation. See
+            `JAX's The Autodiff Cookbook <https://jax.readthedocs.io/en/latest/notebooks/autodiff_cookbook.html>`_
+            for more information.
         :param SVIState init_state: if not None, begin SVI from the
             final state of previous SVI run. Usage::
 
@@ -322,11 +368,13 @@ class SVI(object):
                 # continue from the end of the previous svi run rather than beginning again from iteration 0
                 svi_result = svi.run(random.PRNGKey(1), 2000, data, init_state=svi_result.state)
 
+        :param dict init_params: if not None, initialize :class:`numpyro.param` sites with values from
+            this dictionary instead of using ``init_value`` in :class:`numpyro.param` primitives.
         :param kwargs: keyword arguments to the model / guide
         :return: a namedtuple with fields `params` and `losses` where `params`
             holds the optimized values at :class:`numpyro.param` sites,
             and `losses` is the collected loss during the process.
-        :rtype: SVIRunResult
+        :rtype: :data:`SVIRunResult`
         """
 
         if num_steps < 1:
@@ -334,13 +382,23 @@ class SVI(object):
 
         def body_fn(svi_state, _):
             if stable_update:
-                svi_state, loss = self.stable_update(svi_state, *args, **kwargs)
+                svi_state, loss = self.stable_update(
+                    svi_state,
+                    *args,
+                    forward_mode_differentiation=forward_mode_differentiation,
+                    **kwargs,
+                )
             else:
-                svi_state, loss = self.update(svi_state, *args, **kwargs)
+                svi_state, loss = self.update(
+                    svi_state,
+                    *args,
+                    forward_mode_differentiation=forward_mode_differentiation,
+                    **kwargs,
+                )
             return svi_state, loss
 
         if init_state is None:
-            svi_state = self.init(rng_key, *args, **kwargs)
+            svi_state = self.init(rng_key, *args, init_params=init_params, **kwargs)
         else:
             svi_state = init_state
         if progress_bar:
@@ -349,7 +407,7 @@ class SVI(object):
                 batch = max(num_steps // 20, 1)
                 for i in t:
                     svi_state, loss = jit(body_fn)(svi_state, None)
-                    losses.append(loss)
+                    losses.append(jax.device_get(loss))
                     if i % batch == 0:
                         if stable_update:
                             valid_losses = [x for x in losses[i - batch :] if x == x]

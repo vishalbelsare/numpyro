@@ -1,6 +1,8 @@
 # Copyright Contributors to the Pyro project.
 # SPDX-License-Identifier: Apache-2.0
 
+from functools import partial
+
 import numpy as np
 from numpy.testing import assert_allclose
 import pytest
@@ -13,9 +15,10 @@ import numpyro.distributions as dist
 from numpyro.distributions.transforms import AffineTransform, ExpTransform
 import numpyro.handlers as handlers
 from numpyro.infer import MCMC, NUTS, SVI, Trace_ELBO
-from numpyro.infer.autoguide import AutoIAFNormal
+from numpyro.infer.autoguide import AutoDiagonalNormal, AutoIAFNormal
 from numpyro.infer.reparam import (
     CircularReparam,
+    ExplicitReparam,
     LocScaleReparam,
     NeuTraReparam,
     ProjectedNormalReparam,
@@ -33,8 +36,8 @@ def get_moments(x):
     xxx = x * xx
     xxxx = xx * xx
     m2 = jnp.mean(xx, axis=0)
-    m3 = jnp.mean(xxx, axis=0) / m2 ** 1.5
-    m4 = jnp.mean(xxxx, axis=0) / m2 ** 2
+    m3 = jnp.mean(xxx, axis=0) / m2**1.5
+    m4 = jnp.mean(xxxx, axis=0) / m2**2
     return jnp.stack([m1, m2, m3, m4])
 
 
@@ -55,7 +58,7 @@ def circular_moment(x, n):
 
 
 def get_circular_moments(x):
-    return jnp.stack([circular_moment(x, i) for i in range(1, 5)])
+    return jnp.stack([circular_moment(x, i) for i in range(1, 3)])
 
 
 def test_syntax():
@@ -156,7 +159,7 @@ def neals_funnel(dim):
 def dirichlet_categorical(data):
     concentration = jnp.array([1.0, 1.0, 1.0])
     p_latent = numpyro.sample("p", dist.Dirichlet(concentration))
-    with numpyro.plate("N", data.shape[0]):
+    with numpyro.plate("N", data.shape[0] if data is not None else 10):
         numpyro.sample("obs", dist.Categorical(p_latent), obs=data)
     return p_latent
 
@@ -190,7 +193,7 @@ def test_neals_funnel_smoke():
     "model, kwargs",
     [
         (neals_funnel, {"dim": 10}),
-        (dirichlet_categorical, {"data": jnp.ones(10, dtype=jnp.int32)}),
+        (dirichlet_categorical, {"data": np.ones(10, dtype=np.int32)}),
     ],
 )
 def test_reparam_log_joint(model, kwargs):
@@ -212,6 +215,35 @@ def test_reparam_log_joint(model, kwargs):
     assert_allclose(pe_transformed, pe - log_det_jacobian, rtol=2e-7)
 
 
+def test_neutra_reparam_unobserved_model():
+    model = dirichlet_categorical
+    data = jnp.ones(10, dtype=jnp.int32)
+    guide = AutoIAFNormal(model)
+    svi = SVI(model, guide, Adam(1e-3), Trace_ELBO())
+    svi_state = svi.init(random.PRNGKey(0), data)
+    params = svi.get_params(svi_state)
+    neutra = NeuTraReparam(guide, params)
+    reparam_model = neutra.reparam(model)
+    with handlers.seed(rng_seed=0):
+        reparam_model(data=None)
+
+
+def test_neutra_reparam_with_plate():
+    def model():
+        with numpyro.plate("N", 3, dim=-1):
+            x = numpyro.sample("x", dist.Normal(0, 1))
+        assert x.shape == (3,)
+
+    guide = AutoDiagonalNormal(model)
+    svi = SVI(model, guide, Adam(1e-3), Trace_ELBO())
+    svi_state = svi.init(random.PRNGKey(0))
+    params = svi.get_params(svi_state)
+    neutra = NeuTraReparam(guide, params)
+    reparam_model = neutra.reparam(model)
+    with handlers.seed(rng_seed=0):
+        reparam_model()
+
+
 @pytest.mark.parametrize("shape", [(), (4,), (3, 2)], ids=str)
 @pytest.mark.parametrize("centered", [0.0, 0.6, 1.0, None])
 @pytest.mark.parametrize("dist_type", ["Normal", "StudentT"])
@@ -220,6 +252,8 @@ def test_loc_scale(dist_type, centered, shape, event_dim):
     loc = np.random.uniform(-1.0, 1.0, shape)
     scale = np.random.uniform(0.5, 1.5, shape)
     event_dim = min(event_dim, len(shape))
+    if event_dim == 1 and centered is not None:
+        centered = jnp.broadcast_to(centered, shape[-event_dim:])
 
     def model(loc, scale):
         with numpyro.plate_stack("plates", shape[: len(shape) - event_dim]):
@@ -257,6 +291,22 @@ def test_loc_scale(dist_type, centered, shape, event_dim):
     actual_grad = jacobian(get_actual_probe, argnums=(0, 1))(loc, scale)
     assert_allclose(actual_grad[0], expected_grad[0], atol=0.05)  # loc grad
     assert_allclose(actual_grad[1], expected_grad[1], atol=0.05)  # scale grad
+
+
+@pytest.mark.parametrize("centered", [-0.3, 10.0, np.array([0.1, -2.0])])
+def test_loc_scale_centered_invalid(centered):
+    N = 10
+    loc = np.random.uniform(-1.0, 1.0, size=(N, 2))
+    scale = np.random.uniform(0.5, 1.5, size=(N, 2))
+
+    def model(loc, scale):
+        with numpyro.plate("particles", N):
+            numpyro.sample("x", dist.Normal(loc, scale).to_event(1))
+
+    with pytest.raises(ValueError, match=".*does not satisfy.*"):
+        with handlers.reparam(config=LocScaleReparam(centered)):
+            with handlers.seed(rng_seed=10):
+                model(loc, scale)
 
 
 @pytest.mark.parametrize("shape", [(), (4,), (3, 2)], ids=str)
@@ -314,7 +364,7 @@ def test_circular(shape):
         return get_circular_moments(trace["x"]["value"])
 
     def get_actual_probe(loc, concentration):
-        kernel = NUTS(model_act)
+        kernel = NUTS(model_act, dense_mass=True)
         mcmc = MCMC(kernel, num_warmup=1000, num_samples=10000, num_chains=1)
         mcmc.run(random.PRNGKey(0), loc, concentration)
         samples = mcmc.get_samples()
@@ -326,3 +376,66 @@ def test_circular(shape):
     actual_probe = get_actual_probe(loc, concentration)
 
     assert_allclose(actual_probe, expected_probe, atol=0.1)
+
+
+def test_circular_reparam_no_observe():
+    def model():
+        numpyro.sample("x", dist.VonMises(0, 1), obs=0.5)
+
+    with numpyro.handlers.seed(rng_seed=0):
+        with numpyro.handlers.reparam(config={"x": CircularReparam()}):
+            with pytest.raises(AssertionError, match="not support observe"):
+                model()
+
+
+_unconstrain_reparam = numpyro.infer.util._unconstrain_reparam
+
+
+def test_unconstrained_reparam_subsample():
+    def model():
+        with numpyro.plate("N", 10, 2):
+            numpyro.sample("x", dist.HalfNormal(1))
+
+    params = {"x": 3.0}
+    substituted_model = handlers.substitute(
+        handlers.seed(model, rng_seed=0),
+        substitute_fn=partial(_unconstrain_reparam, params),
+    )
+    log_det_site = handlers.trace(substituted_model).get_trace()["_x_log_det"]
+    assert log_det_site["scale"] == 5.0
+
+
+def test_unconstrained_reparam_scale():
+    def model():
+        with handlers.scale(scale=5.0):
+            numpyro.sample("x", dist.HalfNormal(1))
+
+    params = {"x": 3.0}
+    substituted_model = handlers.substitute(
+        handlers.seed(model, rng_seed=0),
+        substitute_fn=partial(_unconstrain_reparam, params),
+    )
+    log_det_site = handlers.trace(substituted_model).get_trace()["_x_log_det"]
+    assert log_det_site["scale"] == 5.0
+
+
+def test_loc_scale_reparam_raise_for_log_normal():
+    def model():
+        numpyro.sample("x", dist.LogNormal(0, 1))
+
+    reparam_model = handlers.reparam(model, config={"x": LocScaleReparam(0)})
+    with pytest.raises(ValueError, match="LocScaleReparam.*"):
+        handlers.seed(reparam_model, rng_seed=0)()
+
+
+def test_explicit_reparam():
+    def model():
+        numpyro.sample("x", dist.Gamma(4, 4))
+
+    reparam = ExplicitReparam(dist.transforms.SoftplusTransform().inv)
+    reparametrized = handlers.reparam(model, {"x": reparam})
+    kernel = NUTS(model=reparametrized)
+    mcmc = MCMC(kernel, num_warmup=1000, num_samples=1000, num_chains=1)
+    mcmc.run(random.PRNGKey(2))
+    samples = mcmc.get_samples()
+    assert abs(samples["x"].mean() - 1) < 0.1

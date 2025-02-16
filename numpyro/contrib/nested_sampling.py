@@ -2,28 +2,33 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from functools import singledispatch
-import warnings
 
-from jax import config, nn, random, tree_util
+import jax
+from jax import random, tree
 import jax.numpy as jnp
 
 try:
-    # jaxns changes the default precision to double precision
-    # so here we undo that action
-    use_x64 = config.jax_enable_x64
+    import jaxns  # noqa: F401
+    from jaxns import (
+        Model,
+        Prior,
+        TerminationCondition,
+        plot_cornerplot,
+        plot_diagnostics,
+        resample,
+        summary,
+    )
+    from jaxns.public import DefaultNestedSampler
+    from jaxns.utils import NestedSamplerResults
 
-    from jaxns.nested_sampling import NestedSampler as OrigNestedSampler
-    from jaxns.plotting import plot_cornerplot, plot_diagnostics
-    from jaxns.prior_transforms.common import ContinuousPrior
-    from jaxns.prior_transforms.prior_chain import PriorChain, UniformBase
-    from jaxns.utils import summary
-
-    config.update("jax_enable_x64", use_x64)
 except ImportError as e:
     raise ImportError(
-        "To use this module, please install `jaxns` package. It can be"
-        " installed with `pip install jaxns`"
+        f"{e} \n "
+        f"To use this module, please install `jaxns>2.5` package. It can be"
+        " installed with `pip install jaxns` with python>=3.8"
     ) from e
+
+import tensorflow_probability.substrates.jax as tfp
 
 import numpyro
 import numpyro.distributions as dist
@@ -34,14 +39,7 @@ from numpyro.infer.util import _guess_max_plate_nesting, _validate_model, log_de
 
 __all__ = ["NestedSampler"]
 
-
-class UniformPrior(ContinuousPrior):
-    def __init__(self, name, shape):
-        prior_base = UniformBase(shape, jnp.result_type(float))
-        super().__init__(name, shape, parents=[], tracked=True, prior_base=prior_base)
-
-    def transform_U(self, U, **kwargs):
-        return U
+tfpd = tfp.distributions
 
 
 @singledispatch
@@ -92,7 +90,7 @@ def _(d):
         # NB: icdf is not available yet for Gamma distribution
         # so this will raise an NotImplementedError for now.
         # We will need scipy.special.gammaincinv, which is not available yet in JAX
-        # see issue: https://github.com/google/jax/issues/5350
+        # see issue: https://github.com/jax-ml/jax/issues/5350
         # TODO: consider wrap jaxns GammaPrior transform implementation
         gammas = uniform_reparam_transform(gamma_dist)(q)
         return gammas / gammas.sum(-1, keepdims=True)
@@ -142,20 +140,12 @@ class NestedSampler:
        Joshua G. Albert (https://arxiv.org/abs/2012.15286)
 
     :param callable model: a call with NumPyro primitives
-    :param int num_live_points: the number of live points. As a rule-of-thumb, we should
-        allocate around 50 live points per possible mode.
-    :param int max_samples: the maximum number of iterations and samples
-    :param str sampler_name: either "slice" (default value) or "multi_ellipsoid"
-    :param int depth: an integer which determines the maximum number of ellipsoids to
-        construct via hierarchical splitting (typical range: 3 - 9, default to 5)
-    :param int num_slices: the number of slice sampling proposals at each sampling step
-        (typical range: 1 - 5, default to 5)
-    :param float termination_frac: termination condition (typical range: 0.001 - 0.01)
-        (default to 0.01).
+    :param dict constructor_kwargs: additional keyword arguments to construct an upstream
+        :class:`jaxns.NestedSampler` instance.
+    :param dict termination_kwargs: keyword arguments to terminate the sampler. Please
+        refer to the upstream :meth:`jaxns.NestedSampler.__call__` method.
 
-    **Example**
-
-    .. doctest::
+    Example::
 
         >>> from jax import random
         >>> import jax.numpy as jnp
@@ -185,23 +175,19 @@ class NestedSampler:
         self,
         model,
         *,
-        num_live_points=1000,
-        max_samples=100000,
-        sampler_name="slice",
-        depth=5,
-        num_slices=5,
-        termination_frac=0.01
+        constructor_kwargs=None,
+        termination_kwargs=None,
     ):
         self.model = model
-        self.num_live_points = num_live_points
-        self.max_samples = max_samples
-        self.termination_frac = termination_frac
-        self.sampler_name = sampler_name
-        self.depth = depth
-        self.num_slices = num_slices
+        self.constructor_kwargs = (
+            constructor_kwargs if constructor_kwargs is not None else {}
+        )
+        self.termination_kwargs = (
+            termination_kwargs if termination_kwargs is not None else {}
+        )
         self._samples = None
         self._log_weights = None
-        self._results = None
+        self._results: NestedSamplerResults | None = None
 
     def run(self, rng_key, *args, **kwargs):
         """
@@ -245,38 +231,71 @@ class NestedSampler:
         else:
             log_density_ = log_density
 
-        def loglik_fn(**params):
-            return log_density_(reparam_model, args, kwargs, params)[0]
+        # Jaxns requires loglikelihood function to have explicit signatures.
+        local_dict = {}
+        loglik_fn_def = """def loglik_fn({}):\n
+        \tparams = dict({})\n
+        \treturn log_density_(reparam_model, args, kwargs, params)[0]
+        """.format(
+            ", ".join([f"{name}_base" for name in param_names]),
+            ", ".join([f"{name}_base={name}_base" for name in param_names]),
+        )
+        exec(loglik_fn_def, locals(), local_dict)
+        loglik_fn = local_dict["loglik_fn"]
 
         # use NestedSampler with identity prior chain
-        prior_chain = PriorChain()
-        for name in param_names:
-            prior = UniformPrior(name + "_base", prototype_trace[name]["fn"].shape())
-            prior_chain.push(prior)
-        # XXX: the `marginalised` keyword in jaxns can be used to get expectation of some
-        # quantity over posterior samples; it can be helpful to expose it in this wrapper
-        ns = OrigNestedSampler(
-            loglik_fn,
-            prior_chain,
-            sampler_name=self.sampler_name,
-            sampler_kwargs={"depth": self.depth, "num_slices": self.num_slices},
-            max_samples=self.max_samples,
-            num_live_points=self.num_live_points,
-            collect_samples=True,
+        def prior_model():
+            params = []
+            for name in param_names:
+                shape = prototype_trace[name]["fn"].shape()
+                param = yield Prior(
+                    tfpd.Uniform(low=jnp.zeros(shape), high=jnp.ones(shape)),
+                    name=name + "_base",
+                )
+                params.append(param)
+            return tuple(params)
+
+        model = Model(prior_model=prior_model, log_likelihood=loglik_fn)
+
+        default_constructor_kwargs = dict(
+            num_live_points=model.U_ndims * 25,
+            devices=jax.devices(),
+            max_samples=1e4,
         )
-        # some places of jaxns uses float64 and raises some warnings if the default dtype is
-        # float32, so we suppress them here to avoid confusion
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore", message=".*will be truncated to dtype float32.*"
+        default_termination_kwargs = dict(dlogZ=1e-4)
+        # Fill-in missing values with defaults. This allows user to inspect what was actually used by inspecting
+        # these dictionaries
+        list(
+            map(
+                lambda item: self.constructor_kwargs.setdefault(*item),
+                default_constructor_kwargs.items(),
             )
-            results = ns(rng_sampling, termination_frac=self.termination_frac)
+        )
+        list(
+            map(
+                lambda item: self.termination_kwargs.setdefault(*item),
+                default_termination_kwargs.items(),
+            )
+        )
+
+        default_ns = DefaultNestedSampler(
+            model=model,
+            **self.constructor_kwargs,
+        )
+
+        termination_reason, state = default_ns(
+            rng_sampling, term_cond=TerminationCondition(**self.termination_kwargs)
+        )
+        results = default_ns.to_results(
+            termination_reason=termination_reason, state=state
+        )
+
         # transform base samples back to original domains
         # Here we only transform the first valid num_samples samples
         # NB: the number of weighted samples obtained from jaxns is results.num_samples
         # and only the first num_samples values of results.samples are valid.
-        num_samples = results.num_samples
-        samples = tree_util.tree_map(lambda x: x[:num_samples], results.samples)
+        num_samples = results.total_num_samples
+        samples = results.samples
         predictive = Predictive(
             reparam_model, samples, return_sites=param_names + deterministics
         )
@@ -284,23 +303,25 @@ class NestedSampler:
         # replace base samples in jaxns results by transformed samples
         self._results = results._replace(samples=samples)
 
-    def get_samples(self, rng_key, num_samples):
+    def get_samples(self, rng_key, num_samples, *, group_by_chain=False):
         """
         Draws samples from the weighted samples collected from the run.
 
         :param random.PRNGKey rng_key: Random number generator key to be used to draw samples.
         :param int num_samples: The number of samples.
+        :param bool group_by_chain: If True, a leading chain dimension of 1 is added to the output arrays.
         :return: a dict of posterior samples
         """
         if self._results is None:
             raise RuntimeError(
                 "NestedSampler.run(...) method should be called first to obtain results."
             )
-
-        samples, log_weights = self.get_weighted_samples()
-        p = nn.softmax(log_weights)
-        idx = random.choice(rng_key, log_weights.shape[0], (num_samples,), p=p)
-        return {k: v[idx] for k, v in samples.items()}
+        weighted_samples, sample_weights = self.get_weighted_samples()
+        samples = resample(
+            rng_key, weighted_samples, sample_weights, S=num_samples, replace=True
+        )
+        chain_dim_sel = None if group_by_chain else Ellipsis
+        return tree.map(lambda x: x[chain_dim_sel], samples)
 
     def get_weighted_samples(self):
         """
@@ -311,8 +332,7 @@ class NestedSampler:
                 "NestedSampler.run(...) method should be called first to obtain results."
             )
 
-        num_samples = self._results.num_samples
-        return self._results.samples, self._results.log_p[:num_samples]
+        return self._results.samples, self._results.log_dp_mean
 
     def print_summary(self):
         """

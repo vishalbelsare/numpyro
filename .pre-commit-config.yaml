@@ -1,0 +1,38 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff
+        entry: ruff check
+        args: ["--fix", "--output-format=full"]
+        files: "(.py$)|(.*.ipynb$)"
+        language: system
+
+      - id: ruff-format
+        name: ruff-format
+        entry: ruff format
+        language: system
+        files: "(.py$)|(.*.ipynb$)"
+
+      - id: mypy
+        name: mypy
+        language: python
+        entry: mypy --install-types --non-interactive
+        files: ^numpyro/
+
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: debug-statements
+      - id: check-yaml
+      - id: check-added-large-files
+        exclude: notebooks/
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.3.0
+    hooks:
+      - id: codespell
+        stages: [pre-commit, commit-msg]
+        args:
+          [--ignore-words-list, "Teh,aas,ans", --check-filenames, --skip, "*.ipynb"]

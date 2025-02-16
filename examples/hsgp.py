@@ -46,6 +46,7 @@ for installation instructions.
 
 
 """
+
 import argparse
 import os
 
@@ -108,7 +109,7 @@ def get_thanksgiving_days(dates):
 
 def get_floating_days_indicators(dates):
     def encode(x):
-        return jnp.array(x.values, dtype=jnp.int64)
+        return jnp.array(x.values, dtype=jnp.result_type(int))
 
     return {
         "labour_days_indicator": encode(get_labour_days(dates)),
@@ -161,7 +162,7 @@ def make_birthdays_data_dict(data):
 # --- Modelling utility functions --- #
 def spectral_density(w, alpha, length):
     c = alpha * jnp.sqrt(2 * jnp.pi) * length
-    e = jnp.exp(-0.5 * (length ** 2) * (w ** 2))
+    e = jnp.exp(-0.5 * (length**2) * (w**2))
     return c * e
 
 
@@ -197,7 +198,7 @@ def diag_spectral_density_periodic(alpha, length, M):
     a = length ** (-2)
     J = jnp.arange(0, M)
     c = jnp.where(J > 0, 2, 1)
-    q2 = (c * alpha ** 2 / jnp.exp(a)) * modified_bessel_first_kind(J, a)
+    q2 = (c * alpha**2 / jnp.exp(a)) * modified_bessel_first_kind(J, a)
     return q2
 
 
@@ -567,6 +568,7 @@ def main(args):
 
 
 if __name__ == "__main__":
+    assert numpyro.__version__.startswith("0.17.0")
     args = parse_arguments()
     numpyro.enable_x64(args.x64)
     numpyro.set_platform(args.device)

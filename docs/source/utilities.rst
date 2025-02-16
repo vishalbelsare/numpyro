@@ -40,6 +40,14 @@ log_density
 -----------
 .. autofunction:: numpyro.infer.util.log_density
 
+compute_log_probs
+-----------------
+.. autofunction:: numpyro.infer.util.compute_log_probs
+
+get_transforms
+--------------
+.. autofunction:: numpyro.infer.util.get_transforms
+
 transform_fn
 ------------
 .. autofunction:: numpyro.infer.util.transform_fn
@@ -47,6 +55,10 @@ transform_fn
 constrain_fn
 ------------
 .. autofunction:: numpyro.infer.util.constrain_fn
+
+unconstrain_fn
+--------------
+.. autofunction:: numpyro.infer.util.unconstrain_fn
 
 potential_energy
 ----------------
@@ -68,6 +80,10 @@ Initialization Strategies
 init_to_feasible
 ^^^^^^^^^^^^^^^^
 .. autofunction:: numpyro.infer.initialization.init_to_feasible
+
+init_to_mean
+^^^^^^^^^^^^
+.. autofunction:: numpyro.infer.initialization.init_to_mean
 
 init_to_median
 ^^^^^^^^^^^^^^
@@ -94,17 +110,24 @@ Tensor Indexing
     :show-inheritance:
     :member-order: bysource
 
-Model inspection
+Model Inspection
 ----------------
-.. autofunction:: numpyro.contrib.render.get_model_relations
+
+get_dependencies
+^^^^^^^^^^^^^^^^
+.. autofunction:: numpyro.infer.inspect.get_dependencies
+
+get_model_relations
+^^^^^^^^^^^^^^^^^^^
+.. autofunction:: numpyro.infer.inspect.get_model_relations
 
 Visualization Utilities
 =======================
 
 render_model
 ------------
-.. autofunction:: numpyro.contrib.render.render_model
+.. autofunction:: numpyro.infer.inspect.render_model
 
-Trace inspection
+Trace Inspection
 ----------------
 .. autofunction:: numpyro.util.format_shapes

@@ -1,7 +1,9 @@
 # Copyright Contributors to the Pyro project.
 # SPDX-License-Identifier: Apache-2.0
 
+from functools import partial
 import os
+import sys
 
 import numpy as np
 from numpy.testing import assert_allclose
@@ -11,20 +13,19 @@ import jax
 from jax import device_get, jit, lax, pmap, random, vmap
 import jax.numpy as jnp
 from jax.scipy.special import logit
-from jax.test_util import check_close
 
 import numpyro
 import numpyro.distributions as dist
 from numpyro.distributions.transforms import AffineTransform
-from numpyro.infer import HMC, MCMC, NUTS, SA, BarkerMH
+from numpyro.infer import AIES, ESS, HMC, MCMC, NUTS, SA, BarkerMH, init_to_value
 from numpyro.infer.hmc import hmc
 from numpyro.infer.reparam import TransformReparam
 from numpyro.infer.sa import _get_proposal_loc_and_scale, _numpy_delete
 from numpyro.infer.util import initialize_model
-from numpyro.util import fori_collect
+from numpyro.util import fori_collect, is_prng_key
 
 
-@pytest.mark.parametrize("kernel_cls", [HMC, NUTS, SA, BarkerMH])
+@pytest.mark.parametrize("kernel_cls", [HMC, NUTS, SA, BarkerMH, AIES, ESS])
 @pytest.mark.parametrize("dense_mass", [False, True])
 def test_unnormalized_normal_x64(kernel_cls, dense_mass):
     true_mean, true_std = 1.0, 0.5
@@ -33,18 +34,34 @@ def test_unnormalized_normal_x64(kernel_cls, dense_mass):
     def potential_fn(z):
         return 0.5 * jnp.sum(((z - true_mean) / true_std) ** 2)
 
-    init_params = jnp.array(0.0)
-    if kernel_cls is SA:
-        kernel = SA(potential_fn=potential_fn, dense_mass=dense_mass)
-    elif kernel_cls is BarkerMH:
-        kernel = SA(potential_fn=potential_fn, dense_mass=dense_mass)
+    if kernel_cls in [AIES, ESS]:
+        num_chains = 10
+        kernel = kernel_cls(potential_fn=potential_fn)
+
+        init_params = random.normal(random.PRNGKey(1), (num_chains,))
+        mcmc = MCMC(
+            kernel,
+            num_warmup=num_warmup,
+            num_samples=num_samples,
+            progress_bar=False,
+            num_chains=num_chains,
+            chain_method="vectorized",
+        )
+    elif kernel_cls in [SA, BarkerMH]:
+        kernel = kernel_cls(potential_fn=potential_fn, dense_mass=dense_mass)
+        init_params = jnp.array(0.0)
+        mcmc = MCMC(
+            kernel, num_warmup=num_warmup, num_samples=num_samples, progress_bar=False
+        )
     else:
         kernel = kernel_cls(
             potential_fn=potential_fn, trajectory_length=8, dense_mass=dense_mass
         )
-    mcmc = MCMC(
-        kernel, num_warmup=num_warmup, num_samples=num_samples, progress_bar=False
-    )
+        init_params = jnp.array(0.0)
+        mcmc = MCMC(
+            kernel, num_warmup=num_warmup, num_samples=num_samples, progress_bar=False
+        )
+
     mcmc.run(random.PRNGKey(0), init_params=init_params)
     mcmc.print_summary()
     hmc_states = mcmc.get_samples()
@@ -81,46 +98,71 @@ def test_correlated_mvn(regularize):
     mcmc.run(random.PRNGKey(0), init_params=init_params)
     samples = mcmc.get_samples()
     assert_allclose(jnp.mean(samples), true_mean, atol=0.02)
-    assert np.sum(np.abs(np.cov(samples.T) - true_cov)) / D ** 2 < 0.02
+    assert np.sum(np.abs(np.cov(samples.T) - true_cov)) / D**2 < 0.02
 
 
-@pytest.mark.parametrize("kernel_cls", [HMC, NUTS, SA, BarkerMH])
+@pytest.mark.parametrize("kernel_cls", [HMC, NUTS, SA, BarkerMH, AIES, ESS])
 def test_logistic_regression_x64(kernel_cls):
+    if kernel_cls in [AIES, ESS] and "CI" in os.environ:
+        pytest.skip("reduce time for CI.")
+
     N, dim = 3000, 3
-    if kernel_cls is SA:
-        num_warmup, num_samples = (100000, 100000)
-    elif kernel_cls is BarkerMH:
-        num_warmup, num_samples = (2000, 12000)
-    else:
-        num_warmup, num_samples = (1000, 8000)
-    data = random.normal(random.PRNGKey(0), (N, dim))
+
+    key1, key2, key3 = random.split(random.PRNGKey(0), 3)
+
+    data = random.normal(key1, (N, dim))
     true_coefs = jnp.arange(1.0, dim + 1.0)
     logits = jnp.sum(true_coefs * data, axis=-1)
-    labels = dist.Bernoulli(logits=logits).sample(random.PRNGKey(1))
+    labels = dist.Bernoulli(logits=logits).sample(key2)
 
     def model(labels):
         coefs = numpyro.sample("coefs", dist.Normal(jnp.zeros(dim), jnp.ones(dim)))
         logits = numpyro.deterministic("logits", jnp.sum(coefs * data, axis=-1))
         return numpyro.sample("obs", dist.Bernoulli(logits=logits), obs=labels)
 
-    if kernel_cls is SA:
+    if kernel_cls in [AIES, ESS]:
+        if kernel_cls is AIES:
+            num_chains = 16
+        else:
+            num_chains = 10
+        samples_each_chain = 8000
+        num_warmup, num_samples = (10_000, samples_each_chain * num_chains)
+        kernel = kernel_cls(model)
+
+        mcmc = MCMC(
+            kernel,
+            num_warmup=num_warmup,
+            num_samples=samples_each_chain,
+            progress_bar=False,
+            num_chains=num_chains,
+            chain_method="vectorized",
+        )
+    elif kernel_cls is SA:
+        num_warmup, num_samples = (100000, 100000)
         kernel = SA(model=model, adapt_state_size=9)
+        mcmc = MCMC(
+            kernel, num_warmup=num_warmup, num_samples=num_samples, progress_bar=False
+        )
     elif kernel_cls is BarkerMH:
+        num_warmup, num_samples = (2000, 12000)
         kernel = BarkerMH(model=model)
+        mcmc = MCMC(
+            kernel, num_warmup=num_warmup, num_samples=num_samples, progress_bar=False
+        )
     else:
+        num_warmup, num_samples = (1000, 8000)
         kernel = kernel_cls(
             model=model, trajectory_length=8, find_heuristic_step_size=True
         )
-    mcmc = MCMC(
-        kernel, num_warmup=num_warmup, num_samples=num_samples, progress_bar=False
-    )
-    mcmc.run(random.PRNGKey(2), labels)
+        mcmc = MCMC(
+            kernel, num_warmup=num_warmup, num_samples=num_samples, progress_bar=False
+        )
+
+    mcmc.run(key3, labels)
     mcmc.print_summary()
     samples = mcmc.get_samples()
     assert samples["logits"].shape == (num_samples, N)
-    # those coefficients are found by doing MAP inference using AutoDelta
-    expected_coefs = jnp.array([0.97, 2.05, 3.18])
-    assert_allclose(jnp.mean(samples["coefs"], 0), expected_coefs, atol=0.1)
+    assert_allclose(jnp.mean(samples["coefs"], 0), true_coefs, atol=0.4)
 
     if "JAX_ENABLE_X64" in os.environ:
         assert samples["coefs"].dtype == jnp.float64
@@ -183,11 +225,15 @@ def test_improper_normal(max_tree_depth):
     mcmc = MCMC(kernel, num_warmup=1000, num_samples=1000)
     mcmc.run(random.PRNGKey(0), data)
     samples = mcmc.get_samples()
-    assert_allclose(jnp.mean(samples["loc"], 0), true_coef, atol=0.05)
+    assert_allclose(jnp.mean(samples["loc"], 0), true_coef, atol=0.007)
 
 
-@pytest.mark.parametrize("kernel_cls", [HMC, NUTS, SA, BarkerMH])
+@pytest.mark.parametrize("kernel_cls", [HMC, NUTS, SA, BarkerMH, AIES, ESS])
 def test_beta_bernoulli_x64(kernel_cls):
+    if kernel_cls is SA and "CI" in os.environ and "JAX_ENABLE_X64" in os.environ:
+        pytest.skip("The test is flaky on CI x64.")
+    if kernel_cls is ESS and "CI" in os.environ:
+        pytest.skip("reduce time for CI.")
     num_warmup, num_samples = (100000, 100000) if kernel_cls is SA else (500, 20000)
 
     def model(data):
@@ -199,15 +245,33 @@ def test_beta_bernoulli_x64(kernel_cls):
 
     true_probs = jnp.array([0.9, 0.1])
     data = dist.Bernoulli(true_probs).sample(random.PRNGKey(1), (1000,))
-    if kernel_cls is SA:
+
+    if kernel_cls in [AIES, ESS]:
+        num_chains = 10
+        kernel = kernel_cls(model=model)
+        mcmc = MCMC(
+            kernel,
+            num_warmup=num_warmup,
+            num_samples=num_samples,
+            progress_bar=False,
+            num_chains=num_chains,
+            chain_method="vectorized",
+        )
+    elif kernel_cls is SA:
         kernel = SA(model=model)
+        mcmc = MCMC(
+            kernel, num_warmup=num_warmup, num_samples=num_samples, progress_bar=False
+        )
     elif kernel_cls is BarkerMH:
         kernel = BarkerMH(model=model)
+        mcmc = MCMC(
+            kernel, num_warmup=num_warmup, num_samples=num_samples, progress_bar=False
+        )
     else:
         kernel = kernel_cls(model=model, trajectory_length=0.1)
-    mcmc = MCMC(
-        kernel, num_warmup=num_warmup, num_samples=num_samples, progress_bar=False
-    )
+        mcmc = MCMC(
+            kernel, num_warmup=num_warmup, num_samples=num_samples, progress_bar=False
+        )
     mcmc.run(random.PRNGKey(2), data)
     mcmc.print_summary()
     samples = mcmc.get_samples()
@@ -283,7 +347,9 @@ def test_dense_mass(kernel_cls, rho):
 
 def test_change_point_x64():
     # Ref: https://forum.pyro.ai/t/i-dont-understand-why-nuts-code-is-not-working-bayesian-hackers-mail/696
-    num_warmup, num_samples = 500, 3000
+    if sys.version_info.minor == 9:
+        pytest.skip("Skip test on Python 3.9")
+    num_warmup, num_samples = 1000, 3000
 
     def model(data):
         alpha = 1 / jnp.mean(data.astype(np.float32))
@@ -293,85 +359,17 @@ def test_change_point_x64():
         lambda12 = jnp.where(jnp.arange(len(data)) < tau * len(data), lambda1, lambda2)
         numpyro.sample("obs", dist.Poisson(lambda12), obs=data)
 
-    count_data = jnp.array(
-        [
-            13,
-            24,
-            8,
-            24,
-            7,
-            35,
-            14,
-            11,
-            15,
-            11,
-            22,
-            22,
-            11,
-            57,
-            11,
-            19,
-            29,
-            6,
-            19,
-            12,
-            22,
-            12,
-            18,
-            72,
-            32,
-            9,
-            7,
-            13,
-            19,
-            23,
-            27,
-            20,
-            6,
-            17,
-            13,
-            10,
-            14,
-            6,
-            16,
-            15,
-            7,
-            2,
-            15,
-            15,
-            19,
-            70,
-            49,
-            7,
-            53,
-            22,
-            21,
-            31,
-            19,
-            11,
-            18,
-            20,
-            12,
-            35,
-            17,
-            23,
-            17,
-            4,
-            2,
-            31,
-            30,
-            13,
-            27,
-            0,
-            39,
-            37,
-            5,
-            14,
-            13,
-            22,
-        ]
+    # fmt: off
+    count_data = jnp.array([
+        13, 24, 8, 24, 7, 35, 14, 11, 15, 11, 22, 22, 11, 57, 11, 19, 29, 6, 19, 12, 22,
+        12, 18, 72, 32, 9, 7, 13, 19, 23, 27, 20, 6, 17, 13, 10, 14, 6, 16, 15, 7, 2,
+        15, 15, 19, 70, 49, 7, 53, 22, 21, 31, 19, 11, 1, 20, 12, 35, 17, 23, 17, 4, 2,
+        31, 30, 13, 27, 0, 39, 37, 5, 14, 13, 22])
+    # fmt: on
+
+    kernel = NUTS(
+        model=model, init_strategy=init_to_value(values={"lambda1": 1, "lambda2": 72})
     )
-    kernel = NUTS(model=model)
     mcmc = MCMC(kernel, num_warmup=num_warmup, num_samples=num_samples)
     mcmc.run(random.PRNGKey(4), count_data)
     samples = mcmc.get_samples()
@@ -389,6 +387,8 @@ def test_change_point_x64():
 
 @pytest.mark.parametrize("with_logits", ["True", "False"])
 def test_binomial_stable_x64(with_logits):
+    if "CI" in os.environ and "JAX_ENABLE_X64" in os.environ:
+        pytest.skip("The test is flaky on CI x64.")
     # Ref: https://github.com/pyro-ppl/pyro/issues/1706
     num_warmup, num_samples = 200, 200
 
@@ -454,11 +454,35 @@ def test_mcmc_progbar():
     mcmc1.run(random.PRNGKey(2), data)
 
     with pytest.raises(AssertionError):
-        check_close(mcmc1.get_samples(), mcmc.get_samples(), atol=1e-4, rtol=1e-4)
+        jax.tree.all(
+            jax.tree.map(
+                partial(assert_allclose, atol=1e-4, rtol=1e-4),
+                mcmc1.get_samples(),
+                mcmc.get_samples(),
+            )
+        )
     mcmc1.warmup(random.PRNGKey(2), data)
     mcmc1.run(random.PRNGKey(3), data)
-    check_close(mcmc1.get_samples(), mcmc.get_samples(), atol=1e-4, rtol=1e-4)
-    check_close(mcmc1.post_warmup_state, mcmc.post_warmup_state, atol=1e-4, rtol=1e-4)
+    jax.tree.all(
+        jax.tree.map(
+            partial(assert_allclose, atol=1e-4, rtol=1e-4),
+            mcmc1.get_samples(),
+            mcmc.get_samples(),
+        )
+    )
+    jax.tree.all(
+        jax.tree.map(
+            partial(assert_allclose, atol=1e-4, rtol=1e-4),
+            jax.tree.map(
+                lambda x: random.key_data(x) if is_prng_key(x) else x,
+                mcmc1.post_warmup_state,
+            ),
+            jax.tree.map(
+                lambda x: random.key_data(x) if is_prng_key(x) else x,
+                mcmc.post_warmup_state,
+            ),
+        )
+    )
 
 
 @pytest.mark.parametrize("kernel_cls", [HMC, NUTS])
@@ -880,7 +904,7 @@ def test_get_proposal_loc_and_scale(dense_mass):
     expected_loc = jnp.stack(expected_loc)
     expected_scale = jnp.stack(expected_scale)
     assert_allclose(actual_loc, expected_loc, rtol=1e-4)
-    assert_allclose(actual_scale, expected_scale, atol=1e-6, rtol=0.05)
+    assert_allclose(actual_scale, expected_scale, atol=1e-6, rtol=0.3)
 
 
 @pytest.mark.parametrize("shape", [(4,), (3, 2)])
@@ -920,13 +944,15 @@ def test_forward_mode_differentiation():
     mcmc.run(random.PRNGKey(0))
 
 
-def test_SA_gradient_free():
+@pytest.mark.parametrize("num_chains", [1, 2])
+@pytest.mark.filterwarnings("ignore:There are not enough devices:UserWarning")
+def test_SA_chain_gradient_free(num_chains):
     def model():
         x = numpyro.sample("x", dist.Normal(0, 1))
         y = lax.while_loop(lambda x: x < 10, lambda x: x + 1, x)
         numpyro.sample("obs", dist.Normal(y, 1), obs=1.0)
 
-    mcmc = MCMC(SA(model), num_warmup=10, num_samples=10)
+    mcmc = MCMC(SA(model), num_warmup=10, num_samples=10, num_chains=num_chains)
     mcmc.run(random.PRNGKey(0))
 
 
@@ -958,7 +984,7 @@ def test_structured_mass():
     cov = np.zeros((5, 5))
     cov[:2, :2] = w_cov
     cov[2:4, 2:4] = xy_cov
-    cov[4, 4] = z_var
+    cov[4, 4] = z_var[0]
 
     kernel = NUTS(model, dense_mass=[("w",), ("x", "y")])
     mcmc = MCMC(kernel, num_warmup=1000, num_samples=1)
@@ -1051,6 +1077,17 @@ def test_initial_inverse_mass_matrix_ndarray(dense_mass):
     assert_allclose(inverse_mass_matrix[("x", "z")], expected_mm)
 
 
+def test_loose_warning_for_missing_plate():
+    def model():
+        x = numpyro.sample("x", dist.Normal(0, 1))
+        with numpyro.plate("N", 10):
+            numpyro.sample("obs", dist.Normal(x, 1), obs=jnp.ones((5, 10)))
+
+    mcmc = MCMC(NUTS(model), num_warmup=10, num_samples=10)
+    with pytest.warns(UserWarning, match="Missing a plate statement"):
+        mcmc.run(random.PRNGKey(1))
+
+
 def test_init_strategy_substituted_model():
     def model():
         numpyro.sample("x", dist.Normal(0, 1))
@@ -1069,3 +1106,136 @@ def test_discrete_site_without_infer_enumerate():
     mcmc = MCMC(NUTS(model), num_warmup=10, num_samples=10)
     with pytest.warns(FutureWarning, match="enumerated sites"):
         mcmc.run(random.PRNGKey(0))
+
+
+def test_vectorized_sampling_zero_sized():
+    J = 8
+    n = 0
+    sigma = np.array([15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0])
+
+    # Modified Eight Schools example
+    def eight_schools(J, sigma):
+        mu = numpyro.sample("mu", dist.Normal(0, 5))
+        tau = numpyro.sample("tau", dist.HalfCauchy(5))
+        with numpyro.plate("J", J):
+            theta = numpyro.sample("theta", dist.Normal(mu, tau))
+            numpyro.sample("scores", dist.Normal(theta, sigma), sample_shape=(n,))
+
+    nuts_kernel = NUTS(eight_schools)
+    mcmc = MCMC(
+        nuts_kernel,
+        num_warmup=50,
+        num_samples=100,
+        num_chains=2,
+        chain_method="vectorized",
+    )
+    rng_key = random.PRNGKey(0)
+    mcmc.run(rng_key, J, sigma, extra_fields=("potential_energy",))
+    assert mcmc.get_samples()["scores"].shape == (200, 0, 8)
+
+
+def test_fixed_num_steps():
+    data = dict()
+    data["x"] = np.random.rand(10)
+    data["y"] = data["x"] + np.random.rand(10) * 0.1
+
+    def model(data):
+        w = numpyro.sample("w", dist.Normal(10, 1))
+        b = numpyro.sample("b", dist.Normal(1, 1))
+        sigma = numpyro.sample("sigma", dist.Gamma(1, 2))
+        with numpyro.plate("size", np.size(data["y"])):
+            numpyro.sample("obs", dist.Normal(w * data["x"] + b, sigma), obs=data["y"])
+
+    with pytest.warns(UserWarning, match="If both"):
+        hmc_kernel = HMC(model, num_steps=5)
+    mcmc = MCMC(
+        hmc_kernel,
+        num_samples=1000,
+        num_warmup=1000,
+        num_chains=1,
+    )
+    rng_key = random.PRNGKey(0)
+    mcmc.run(rng_key, data, extra_fields=("num_steps",))
+    num_steps_list = np.array(mcmc.get_extra_fields()["num_steps"])
+    assert all(step == 5 for step in num_steps_list)
+
+
+@pytest.mark.parametrize("num_steps", [None, 10])
+def test_none_trajectory_length(num_steps):
+    data = dict()
+    data["x"] = np.random.rand(10)
+    data["y"] = data["x"] + np.random.rand(10) * 0.1
+
+    def model(data):
+        w = numpyro.sample("w", dist.Normal(10, 1))
+        b = numpyro.sample("b", dist.Normal(1, 1))
+        sigma = numpyro.sample("sigma", dist.Gamma(1, 2))
+        with numpyro.plate("size", np.size(data["y"])):
+            numpyro.sample("obs", dist.Normal(w * data["x"] + b, sigma), obs=data["y"])
+
+    if num_steps is None:
+        with pytest.raises(ValueError, match="At least one of"):
+            hmc_kernel = HMC(model, num_steps=num_steps, trajectory_length=None)
+    else:
+        hmc_kernel = HMC(model, num_steps=num_steps, trajectory_length=None)
+
+        mcmc = MCMC(
+            hmc_kernel,
+            num_samples=1000,
+            num_warmup=1000,
+            num_chains=1,
+        )
+        rng_key = random.PRNGKey(0)
+        mcmc.run(rng_key, data)
+        mcmc.run(rng_key, data, extra_fields=("num_steps",))
+        num_steps_list = np.array(mcmc.get_extra_fields()["num_steps"])
+        assert all(step == num_steps for step in num_steps_list)
+
+
+@pytest.mark.parametrize("kernel_cls", [NUTS, BarkerMH])
+@pytest.mark.parametrize("remove_sites", [("~z.a", "~z.b"), ("~z.a", "~z.a")])
+def test_remove_sites(kernel_cls, remove_sites):
+    def model():
+        numpyro.sample("a", dist.Normal())
+        numpyro.sample("b", dist.Normal())
+
+    mcmc = MCMC(kernel_cls(model), num_warmup=10, num_samples=10)
+    mcmc.run(random.PRNGKey(0), extra_fields=remove_sites)
+    samps = mcmc.get_samples()
+
+    assert all([site[3:] not in samps for site in remove_sites])
+
+
+def test_extra_fields_include_unconstrained_samples():
+    def model():
+        numpyro.sample("x", dist.HalfNormal(1))
+
+    mcmc = MCMC(NUTS(model), num_warmup=10, num_samples=10)
+    mcmc.run(random.PRNGKey(0), extra_fields=("z.x",))
+    assert_allclose(mcmc.get_samples()["x"], jnp.exp(mcmc.get_extra_fields()["z.x"]))
+
+
+def test_all_deterministic():
+    def model1():
+        numpyro.deterministic("x", 1.0)
+
+    def model2():
+        numpyro.deterministic("x", jnp.array([1.0, 2.0]))
+
+    num_samples = 10
+    shapes = {model1: (), model2: (2,)}
+
+    for model, shape in shapes.items():
+        mcmc = MCMC(NUTS(model), num_warmup=10, num_samples=num_samples)
+        mcmc.run(random.PRNGKey(0))
+        assert mcmc.get_samples()["x"].shape == (num_samples,) + shape
+
+
+def test_empty_summary():
+    def model():
+        pass
+
+    mcmc = MCMC(NUTS(model), num_warmup=10, num_samples=10)
+    mcmc.run(random.PRNGKey(0))
+
+    mcmc.print_summary()

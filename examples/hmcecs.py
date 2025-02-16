@@ -75,9 +75,9 @@ def run_hmc(mcmc_key, args, data, obs, kernel):
 
 
 def main(args):
-    assert (
-        11_000_000 >= args.num_datapoints
-    ), "11,000,000 data points in the Higgs dataset"
+    assert 11_000_000 >= args.num_datapoints, (
+        "11,000,000 data points in the Higgs dataset"
+    )
     # full dataset takes hours for plain hmc!
     if args.dataset == "higgs":
         _, fetch = load_dataset(
@@ -139,6 +139,7 @@ def summary_plot(losses, hmc_samples, hmcecs_samples, hmc_runtime, hmcecs_runtim
 
 
 if __name__ == "__main__":
+    assert numpyro.__version__.startswith("0.17.0")
     parser = argparse.ArgumentParser(
         "Hamiltonian Monte Carlo with Energy Conserving Subsampling"
     )

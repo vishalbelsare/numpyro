@@ -2,10 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import warnings
 
-from numpyro import compat, diagnostics, distributions, handlers, infer, optim
-from numpyro.contrib.render import render_model
+warnings.filterwarnings(
+    "ignore", message=".*Attempting to hash a tracer.*", category=FutureWarning
+)
+
+# ruff: noqa: E402
+
+from numpyro import compat, diagnostics, distributions, handlers, infer, ops, optim
 from numpyro.distributions.distribution import enable_validation, validation_enabled
+from numpyro.infer.inspect import render_model
 import numpyro.patch  # noqa: F401
 from numpyro.primitives import (
     deterministic,
@@ -44,6 +51,7 @@ __all__ = [
     "handlers",
     "infer",
     "module",
+    "ops",
     "optim",
     "param",
     "plate",

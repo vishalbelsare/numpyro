@@ -30,6 +30,7 @@ generate a better representation of the encoded latent vector.
 .. image:: ../_static/img/examples/prodlda.png
     :align: center
 """
+
 import argparse
 
 import matplotlib.pyplot as plt
@@ -235,7 +236,7 @@ def load_data():
     docs = jnp.array(vectorizer.fit_transform(news["data"]).toarray())
 
     vocab = pd.DataFrame(columns=["word", "index"])
-    vocab["word"] = vectorizer.get_feature_names()
+    vocab["word"] = vectorizer.get_feature_names_out()
     vocab["index"] = vocab.index
 
     return docs, vocab
@@ -314,7 +315,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    assert numpyro.__version__.startswith("0.8.0")
+    assert numpyro.__version__.startswith("0.17.0")
     parser = argparse.ArgumentParser(
         description="Probabilistic topic modelling with Flax and Haiku"
     )

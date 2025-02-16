@@ -1,6 +1,8 @@
 # Copyright Contributors to the Pyro project.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 import numpy as np
 from numpy.testing import assert_allclose
 import pytest
@@ -9,9 +11,25 @@ from jax import random
 import jax.numpy as jnp
 
 import numpyro
-from numpyro.contrib.nested_sampling import NestedSampler, UniformReparam
+
+try:
+    if os.environ.get("JAX_ENABLE_X64"):
+        from numpyro.contrib.nested_sampling import NestedSampler, UniformReparam
+
+except ImportError:
+    pytestmark = pytest.mark.skip(reason="jaxns is not installed")
+
 import numpyro.distributions as dist
 from numpyro.distributions.transforms import AffineTransform, ExpTransform
+
+pytestmark = [
+    pytest.mark.filterwarnings("ignore:jax.tree_.+ is deprecated:FutureWarning"),
+    pytest.mark.filterwarnings("ignore:JAX x64"),
+    pytest.mark.skipif(
+        not os.environ.get("JAX_ENABLE_X64"),
+        reason="test suite for jaxns requires double precision",
+    ),
+]
 
 
 # Test helper to extract a few central moments from samples.
@@ -22,8 +40,8 @@ def get_moments(x):
     xxx = x * xx
     xxxx = xx * xx
     m2 = jnp.mean(xx, axis=0)
-    m3 = jnp.mean(xxx, axis=0) / m2 ** 1.5
-    m4 = jnp.mean(xxxx, axis=0) / m2 ** 2
+    m3 = jnp.mean(xxx, axis=0) / m2**1.5
+    m4 = jnp.mean(xxxx, axis=0) / m2**2
     return jnp.stack([m1, m2, m3, m4])
 
 
@@ -77,7 +95,7 @@ def test_dense_mass(rho):
             "x", dist.MultivariateNormal(jnp.zeros(2), covariance_matrix=true_cov)
         )
 
-    ns = NestedSampler(model)
+    ns = NestedSampler(model, constructor_kwargs={"num_live_points": 200})
     ns.run(random.PRNGKey(0))
 
     samples = ns.get_samples(random.PRNGKey(1), 1000)["x"]

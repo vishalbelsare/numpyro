@@ -9,7 +9,7 @@ In this example, we run MCMC for various crowdsourced annotation models in [1].
 
 All models have discrete latent variables. Under the hood, we enumerate over
 (marginalize out) those discrete latent sites in inference. Those models have different
-complexity so they are great refererences for those who are new to Pyro/NumPyro
+complexity so they are great references for those who are new to Pyro/NumPyro
 enumeration mechanism. We recommend readers compare the implementations with the
 corresponding plate diagrams in [1] to see how concise a Pyro/NumPyro program is.
 
@@ -57,55 +57,24 @@ def get_data():
     """
     # NB: the first annotator assessed each item 3 times
     positions = np.array([1, 1, 1, 2, 3, 4, 5])
+    # fmt: off
     annotations = np.array(
-        [
-            [1, 1, 1, 1, 1, 1, 1],
-            [3, 3, 3, 4, 3, 3, 4],
-            [1, 1, 2, 2, 1, 2, 2],
-            [2, 2, 2, 3, 1, 2, 1],
-            [2, 2, 2, 3, 2, 2, 2],
-            [2, 2, 2, 3, 3, 2, 2],
-            [1, 2, 2, 2, 1, 1, 1],
-            [3, 3, 3, 3, 4, 3, 3],
-            [2, 2, 2, 2, 2, 2, 3],
-            [2, 3, 2, 2, 2, 2, 3],
-            [4, 4, 4, 4, 4, 4, 4],
-            [2, 2, 2, 3, 3, 4, 3],
-            [1, 1, 1, 1, 1, 1, 1],
-            [2, 2, 2, 3, 2, 1, 2],
-            [1, 2, 1, 1, 1, 1, 1],
-            [1, 1, 1, 2, 1, 1, 1],
-            [1, 1, 1, 1, 1, 1, 1],
-            [1, 1, 1, 1, 1, 1, 1],
-            [2, 2, 2, 2, 2, 2, 1],
-            [2, 2, 2, 1, 3, 2, 2],
-            [2, 2, 2, 2, 2, 2, 2],
-            [2, 2, 2, 2, 2, 2, 1],
-            [2, 2, 2, 3, 2, 2, 2],
-            [2, 2, 1, 2, 2, 2, 2],
-            [1, 1, 1, 1, 1, 1, 1],
-            [1, 1, 1, 1, 1, 1, 1],
-            [2, 3, 2, 2, 2, 2, 2],
-            [1, 1, 1, 1, 1, 1, 1],
-            [1, 1, 1, 1, 1, 1, 1],
-            [1, 1, 2, 1, 1, 2, 1],
-            [1, 1, 1, 1, 1, 1, 1],
-            [3, 3, 3, 3, 2, 3, 3],
-            [1, 1, 1, 1, 1, 1, 1],
-            [2, 2, 2, 2, 2, 2, 2],
-            [2, 2, 2, 3, 2, 3, 2],
-            [4, 3, 3, 4, 3, 4, 3],
-            [2, 2, 1, 2, 2, 3, 2],
-            [2, 3, 2, 3, 2, 3, 3],
-            [3, 3, 3, 3, 4, 3, 2],
-            [1, 1, 1, 1, 1, 1, 1],
-            [1, 1, 1, 1, 1, 1, 1],
-            [1, 2, 1, 2, 1, 1, 1],
-            [2, 3, 2, 2, 2, 2, 2],
-            [1, 2, 1, 1, 1, 1, 1],
-            [2, 2, 2, 2, 2, 2, 2],
-        ]
-    )
+        [[1, 1, 1, 1, 1, 1, 1], [3, 3, 3, 4, 3, 3, 4], [1, 1, 2, 2, 1, 2, 2],
+         [2, 2, 2, 3, 1, 2, 1], [2, 2, 2, 3, 2, 2, 2], [2, 2, 2, 3, 3, 2, 2],
+         [1, 2, 2, 2, 1, 1, 1], [3, 3, 3, 3, 4, 3, 3], [2, 2, 2, 2, 2, 2, 3],
+         [2, 3, 2, 2, 2, 2, 3], [4, 4, 4, 4, 4, 4, 4], [2, 2, 2, 3, 3, 4, 3],
+         [1, 1, 1, 1, 1, 1, 1], [2, 2, 2, 3, 2, 1, 2], [1, 2, 1, 1, 1, 1, 1],
+         [1, 1, 1, 2, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1],
+         [2, 2, 2, 2, 2, 2, 1], [2, 2, 2, 1, 3, 2, 2], [2, 2, 2, 2, 2, 2, 2],
+         [2, 2, 2, 2, 2, 2, 1], [2, 2, 2, 3, 2, 2, 2], [2, 2, 1, 2, 2, 2, 2],
+         [1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1], [2, 3, 2, 2, 2, 2, 2],
+         [1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1], [1, 1, 2, 1, 1, 2, 1],
+         [1, 1, 1, 1, 1, 1, 1], [3, 3, 3, 3, 2, 3, 3], [1, 1, 1, 1, 1, 1, 1],
+         [2, 2, 2, 2, 2, 2, 2], [2, 2, 2, 3, 2, 3, 2], [4, 3, 3, 4, 3, 4, 3],
+         [2, 2, 1, 2, 2, 3, 2], [2, 3, 2, 3, 2, 3, 3], [3, 3, 3, 3, 4, 3, 2],
+         [1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1], [1, 2, 1, 2, 1, 1, 1],
+         [2, 3, 2, 2, 2, 2, 2], [1, 2, 1, 1, 1, 1, 1], [2, 2, 2, 2, 2, 2, 2]])
+    # fmt: on
     # we minus 1 because in Python, the first index is 0
     return positions - 1, annotations - 1
 
@@ -332,8 +301,26 @@ def main(args):
         print(row_format.format(f"item[{i}]", *row))
 
 
+# %%
+# .. note::
+#     In the above inference code, we marginalized the discrete latent variables `c`
+#     hence `mcmc.get_samples(...)` does not include samples of `c`. We then utilize
+#     `Predictive(..., infer_discrete=True)` to get posterior samples for `c`, which
+#     is stored in `discrete_samples`. To merge those discrete samples into the `mcmc`
+#     instance, we can use the following pattern::
+#
+#         chain_discrete_samples = jax.tree.map(
+#             lambda x: x.reshape((args.num_chains, args.num_samples) + x.shape[1:]),
+#             discrete_samples)
+#         mcmc.get_samples().update(discrete_samples)
+#         mcmc.get_samples(group_by_chain=True).update(chain_discrete_samples)
+#
+#     This is useful when we want to pass the `mcmc` instance to `arviz` through
+#     `arviz.from_numpyro(mcmc)`.
+
+
 if __name__ == "__main__":
-    assert numpyro.__version__.startswith("0.8.0")
+    assert numpyro.__version__.startswith("0.17.0")
     parser = argparse.ArgumentParser(description="Bayesian Models of Annotation")
     parser.add_argument("-n", "--num-samples", nargs="?", default=1000, type=int)
     parser.add_argument("--num-warmup", nargs="?", default=1000, type=int)

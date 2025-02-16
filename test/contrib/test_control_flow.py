@@ -10,9 +10,11 @@ import jax.numpy as jnp
 import numpyro
 from numpyro.contrib.control_flow import cond, scan
 import numpyro.distributions as dist
-from numpyro.handlers import seed, substitute, trace
+from numpyro.handlers import mask, seed, substitute, trace
 from numpyro.infer import MCMC, NUTS, SVI, Predictive, Trace_ELBO
-from numpyro.infer.util import potential_energy
+from numpyro.infer.autoguide import AutoNormal
+from numpyro.infer.util import log_density, potential_energy
+from numpyro.optim import Adam
 
 
 def test_scan():
@@ -196,3 +198,93 @@ def test_cond():
         atol=0.1,
     )
     assert_allclose([x.mean(), x.std()], [2.0, jnp.sqrt(5.0)], atol=0.5)
+
+
+def test_scan_promote():
+    def model():
+        def transition_fn(c, val):
+            with numpyro.plate("N", 3, dim=-1):
+                numpyro.sample("x", dist.Normal(0, 1), obs=1.0)
+            return None, None
+
+        scan(transition_fn, None, None, length=10)
+
+    tr = numpyro.handlers.trace(model).get_trace()
+    assert tr["x"]["value"].shape == (10, 1)
+    assert tr["x"]["fn"].log_prob(tr["x"]["value"]).shape == (10, 3)
+
+
+def test_scan_plate_mask():
+    def model(y=None, T=12):
+        def transition(carry, y_curr):
+            x_prev, t = carry
+            with numpyro.plate("N", 10, dim=-1):
+                with mask(mask=(t < T)):
+                    x_curr = numpyro.sample(
+                        "x",
+                        dist.Normal(jnp.zeros((10, 3)), jnp.ones((10, 3))).to_event(1),
+                    )
+                    y_curr = numpyro.sample(
+                        "y",
+                        dist.Normal(x_curr, jnp.ones((10, 3))).to_event(1),
+                        obs=y_curr,
+                    )
+                    return (x_curr, t + 1), None
+
+        x0 = numpyro.sample(
+            "x_0", dist.Normal(jnp.zeros((10, 3)), jnp.ones((10, 3))).to_event(1)
+        )
+
+        x, t = scan(transition, (x0, 0), y, length=T)
+        return (x, y)
+
+    with numpyro.handlers.seed(rng_seed=0):
+        model_density, model_trace = log_density(model, (None, 12), {}, {})
+        assert model_density
+        assert model_trace["x"]["fn"].batch_shape == (12, 10)
+        assert model_trace["x"]["fn"].event_shape == (3,)
+
+
+def test_scan_svi():
+    T = 3
+    N = 5
+
+    def gaussian_hmm(y=None, T=T, N=N):
+        def transition(x_prev, y_curr):
+            with numpyro.plate("data", N):
+                x_curr = numpyro.sample("x", dist.Normal(x_prev, 1.5))
+                y_curr = numpyro.sample("y", dist.Normal(x_curr, 0.1), obs=y_curr)
+            return x_curr, (x_curr, y_curr)
+
+        with numpyro.plate("data", N):
+            x0 = numpyro.sample("x_0", dist.Normal(jnp.zeros(N), 5.0))
+        _, (x, y) = scan(transition, x0, y, length=T)
+        return (x, y)
+
+    with numpyro.handlers.seed(rng_seed=0):
+        x, y = gaussian_hmm()
+    with numpyro.handlers.seed(rng_seed=0):
+        tr = numpyro.handlers.trace(gaussian_hmm).get_trace(y=y, T=T, N=N)
+
+    guide = AutoNormal(gaussian_hmm)
+    svi = SVI(gaussian_hmm, guide, Adam(0.1), Trace_ELBO(), y=y, T=T, N=N)
+    results = svi.run(random.PRNGKey(0), 10**3)
+
+    xhat = results.params["x_auto_loc"]
+    assert_allclose(xhat, tr["x"]["value"], rtol=0.1, atol=0.2)
+
+
+def test_scan_mvn():
+    def model():
+        def transition(c, a):
+            with numpyro.plate("foo", 5):
+                c2 = numpyro.sample(
+                    "val", dist.MultivariateNormal(c + a, scale_tril=jnp.eye(2))
+                )
+            return c2, c2
+
+        scan(transition, jnp.zeros((5, 2)), jnp.ones((4, 5, 2)))
+
+    with numpyro.handlers.seed(rng_seed=0), numpyro.handlers.trace() as tr:
+        model()
+    assert tr["val"]["fn"].batch_shape == (4, 5)

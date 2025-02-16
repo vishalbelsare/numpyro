@@ -22,7 +22,6 @@ import argparse
 
 import matplotlib.pyplot as plt
 
-import jax
 from jax import random
 import jax.numpy as jnp
 
@@ -63,9 +62,7 @@ def run_inference(args, data):
     print("=== Performing Nested Sampling ===")
     ns = NestedSampler(model)
     ns.run(random.PRNGKey(0), **data, enum=args.enum)
-    # TODO: Remove this condition when jaxns is compatible with the latest jax version.
-    if jax.__version__ < "0.2.21":
-        ns.print_summary()
+    ns.print_summary()
     # samples obtained from nested sampler are weighted, so
     # we need to provide random key to resample from those weighted samples
     ns_samples = ns.get_samples(random.PRNGKey(1), num_samples=args.num_samples)
@@ -81,7 +78,7 @@ def run_inference(args, data):
             num_warmup=args.num_warmup,
             num_samples=args.num_samples,
         )
-    mcmc.run(random.PRNGKey(2), **data)
+    mcmc.run(random.PRNGKey(2), **data, enum=args.enum)
     mcmc.print_summary()
     mcmc_samples = mcmc.get_samples()
 
@@ -123,7 +120,8 @@ def main(args):
 
 
 if __name__ == "__main__":
-    assert numpyro.__version__.startswith("0.8.0")
+    assert numpyro.__version__.startswith("0.17.0")
+
     parser = argparse.ArgumentParser(description="Nested sampler for Gaussian shells")
     parser.add_argument("-n", "--num-samples", nargs="?", default=10000, type=int)
     parser.add_argument("--num-warmup", nargs="?", default=1000, type=int)
@@ -136,6 +134,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cpu", type=str, help='use "cpu" or "gpu".')
     args = parser.parse_args()
 
+    numpyro.enable_x64()
     numpyro.set_platform(args.device)
 
     main(args)

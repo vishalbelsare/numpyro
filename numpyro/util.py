@@ -3,10 +3,14 @@
 
 from collections import OrderedDict
 from contextlib import contextmanager
+from functools import partial
+import inspect
 from itertools import zip_longest
 import os
 import random
 import re
+from threading import Lock
+from typing import Any, Callable, Generator, Optional
 import warnings
 
 import numpy as np
@@ -14,18 +18,16 @@ import tqdm
 from tqdm.auto import tqdm as tqdm_auto
 
 import jax
-from jax import device_put, jit, lax, vmap
+from jax import jit, lax, vmap
 from jax.core import Tracer
-from jax.experimental import host_callback
-from jax.flatten_util import ravel_pytree
+from jax.experimental import io_callback
 import jax.numpy as jnp
-from jax.tree_util import tree_flatten, tree_map
 
 _DISABLE_CONTROL_FLOW_PRIM = False
 _CHAIN_RE = re.compile(r"\d+$")  # e.g. get '3' from 'TFRT_CPU_3'
 
 
-def set_rng_seed(rng_seed):
+def set_rng_seed(rng_seed: Optional[int] = None) -> None:
     """
     Initializes internal state for the Python and NumPy random number generators.
 
@@ -35,7 +37,7 @@ def set_rng_seed(rng_seed):
     np.random.seed(rng_seed)
 
 
-def enable_x64(use_x64=True):
+def enable_x64(use_x64: bool = True) -> None:
     """
     Changes the default array type to use 64 bit precision as in NumPy.
 
@@ -43,11 +45,11 @@ def enable_x64(use_x64=True):
         else 32 bits.
     """
     if not use_x64:
-        use_x64 = os.getenv("JAX_ENABLE_X64", 0)
+        use_x64 = bool(os.getenv("JAX_ENABLE_X64", 0))
     jax.config.update("jax_enable_x64", use_x64)
 
 
-def set_platform(platform=None):
+def set_platform(platform: Optional[str] = None) -> None:
     """
     Changes platform to CPU, GPU, or TPU. This utility only takes
     effect at the beginning of your program.
@@ -59,7 +61,7 @@ def set_platform(platform=None):
     jax.config.update("jax_platform_name", platform)
 
 
-def set_host_device_count(n):
+def set_host_device_count(n: int) -> None:
     """
     By default, XLA considers all CPU cores as one device. This utility tells XLA
     that there are `n` host (CPU) devices available to use. As a consequence, this
@@ -74,13 +76,13 @@ def set_host_device_count(n):
         `xla_force_host_platform_device_count` flag in XLA is incomplete. If you
         observe some strange phenomenon when using this utility, please let us
         know through our issue or forum page. More information is available in this
-        `JAX issue <https://github.com/google/jax/issues/1408>`_.
+        `JAX issue <https://github.com/jax-ml/jax/issues/1408>`_.
 
     :param int n: number of CPU devices to use.
     """
-    xla_flags = os.getenv("XLA_FLAGS", "")
+    xla_flags_str = os.getenv("XLA_FLAGS", "")
     xla_flags = re.sub(
-        r"--xla_force_host_platform_device_count=\S+", "", xla_flags
+        r"--xla_force_host_platform_device_count=\S+", "", xla_flags_str
     ).split()
     os.environ["XLA_FLAGS"] = " ".join(
         ["--xla_force_host_platform_device_count={}".format(n)] + xla_flags
@@ -88,7 +90,7 @@ def set_host_device_count(n):
 
 
 @contextmanager
-def optional(condition, context_manager):
+def optional(condition: bool, context_manager) -> Generator:
     """
     Optionally wrap inside `context_manager` if condition is `True`.
     """
@@ -100,7 +102,7 @@ def optional(condition, context_manager):
 
 
 @contextmanager
-def control_flow_prims_disabled():
+def control_flow_prims_disabled() -> Generator:
     global _DISABLE_CONTROL_FLOW_PRIM
     stored_flag = _DISABLE_CONTROL_FLOW_PRIM
     try:
@@ -110,7 +112,16 @@ def control_flow_prims_disabled():
         _DISABLE_CONTROL_FLOW_PRIM = stored_flag
 
 
-def cond(pred, true_operand, true_fun, false_operand, false_fun):
+def maybe_jit(fn: Callable, *args, **kwargs) -> Callable:
+    if _DISABLE_CONTROL_FLOW_PRIM:
+        return fn
+    else:
+        return jit(fn, *args, **kwargs)
+
+
+def cond(
+    pred: bool, true_operand, true_fun: Callable, false_operand, false_fun: Callable
+) -> Any:
     if _DISABLE_CONTROL_FLOW_PRIM:
         if pred:
             return true_fun(true_operand)
@@ -120,7 +131,7 @@ def cond(pred, true_operand, true_fun, false_operand, false_fun):
         return lax.cond(pred, true_operand, true_fun, false_operand, false_fun)
 
 
-def while_loop(cond_fun, body_fun, init_val):
+def while_loop(cond_fun: Callable, body_fun: Callable, init_val: Any) -> Any:
     if _DISABLE_CONTROL_FLOW_PRIM:
         val = init_val
         while cond_fun(val):
@@ -138,6 +149,15 @@ def fori_loop(lower, upper, body_fun, init_val):
         return val
     else:
         return lax.fori_loop(lower, upper, body_fun, init_val)
+
+
+def is_prng_key(key: jax.Array) -> bool:
+    try:
+        if jax.dtypes.issubdtype(key.dtype, jax.dtypes.prng_key):
+            return key.shape == ()
+        return key.shape == (2,) and key.dtype == np.uint32
+    except AttributeError:
+        return False
 
 
 def not_jax_tracer(x):
@@ -158,13 +178,14 @@ def cached_by(outer_fn, *keys):
 
     def _wrapped(fn):
         fn_cache = outer_fn._cache
-        if keys in fn_cache:
-            fn = fn_cache[keys]
+        hashkeys = (*keys, fn.__name__)
+        if hashkeys in fn_cache:
+            fn = fn_cache[hashkeys]
             # update position
-            del fn_cache[keys]
-            fn_cache[keys] = fn
+            del fn_cache[hashkeys]
+            fn_cache[hashkeys] = fn
         else:
-            fn_cache[keys] = fn
+            fn_cache[hashkeys] = fn
         if len(fn_cache) > max_size:
             fn_cache.popitem(last=False)
         return fn
@@ -172,7 +193,7 @@ def cached_by(outer_fn, *keys):
     return _wrapped
 
 
-def progress_bar_factory(num_samples, num_chains):
+def progress_bar_factory(num_samples: int, num_chains: int) -> Callable:
     """Factory that builds a progress bar decorator along
     with the `set_tqdm_description` and `close_tqdm` functions
     """
@@ -184,69 +205,69 @@ def progress_bar_factory(num_samples, num_chains):
 
     remainder = num_samples % print_rate
 
+    idx_counter = 0  # resource counter to assign chains to progress bars
     tqdm_bars = {}
-    finished_chains = []
+    # lock serializes access to idx_counter since callbacks are multithreaded
+    # this prevents races that assign multiple chains to a progress bar
+    lock = Lock()
     for chain in range(num_chains):
         tqdm_bars[chain] = tqdm_auto(range(num_samples), position=chain)
         tqdm_bars[chain].set_description("Compiling.. ", refresh=True)
 
-    def _update_tqdm(arg, transform, device):
-        chain_match = _CHAIN_RE.search(str(device))
-        assert chain_match
-        chain = int(chain_match.group())
+    def _update_tqdm(increment, chain):
+        increment = int(increment)
+        chain = int(chain)
+        if chain == -1:
+            nonlocal idx_counter
+            with lock:
+                chain = idx_counter
+                idx_counter += 1
         tqdm_bars[chain].set_description(f"Running chain {chain}", refresh=False)
-        tqdm_bars[chain].update(arg)
+        tqdm_bars[chain].update(increment)
+        return chain
 
-    def _close_tqdm(arg, transform, device):
-        chain_match = _CHAIN_RE.search(str(device))
-        assert chain_match
-        chain = int(chain_match.group())
-        tqdm_bars[chain].update(arg)
-        finished_chains.append(chain)
-        if len(finished_chains) == num_chains:
-            for chain in range(num_chains):
-                tqdm_bars[chain].close()
+    def _close_tqdm(increment, chain):
+        increment = int(increment)
+        chain = int(chain)
+        tqdm_bars[chain].update(increment)
+        tqdm_bars[chain].close()
 
-    def _update_progress_bar(iter_num):
+    def _update_progress_bar(iter_num, chain):
         """Updates tqdm progress bar of a JAX loop only if the iteration number is a multiple of the print_rate
         Usage: carry = progress_bar((iter_num, print_rate), carry)
         """
 
-        _ = lax.cond(
+        chain = lax.cond(
             iter_num == 1,
-            lambda _: host_callback.id_tap(
-                _update_tqdm, 0, result=iter_num, tap_with_device=True
-            ),
-            lambda _: iter_num,
+            lambda _: io_callback(_update_tqdm, jnp.array(0), 0, chain),
+            lambda _: chain,
             operand=None,
         )
-        _ = lax.cond(
+        chain = lax.cond(
             iter_num % print_rate == 0,
-            lambda _: host_callback.id_tap(
-                _update_tqdm, print_rate, result=iter_num, tap_with_device=True
-            ),
-            lambda _: iter_num,
+            lambda _: io_callback(_update_tqdm, jnp.array(0), print_rate, chain),
+            lambda _: chain,
             operand=None,
         )
         _ = lax.cond(
             iter_num == num_samples,
-            lambda _: host_callback.id_tap(
-                _close_tqdm, remainder, result=iter_num, tap_with_device=True
-            ),
-            lambda _: iter_num,
+            lambda _: io_callback(_close_tqdm, None, remainder, chain),
+            lambda _: None,
             operand=None,
         )
+        return chain
 
-    def progress_bar_fori_loop(func):
+    def progress_bar_fori_loop(func: Callable) -> Callable:
         """Decorator that adds a progress bar to `body_fun` used in `lax.fori_loop`.
         Note that `body_fun` must be looping over a tuple who's first element is `np.arange(num_samples)`.
         This means that `iter_num` is the current iteration number
         """
 
         def wrapper_progress_bar(i, vals):
-            result = func(i, vals)
-            _update_progress_bar(i + 1)
-            return result
+            (subvals, chain) = vals
+            result = func(i, subvals)
+            chain = _update_progress_bar(i + 1, chain)
+            return (result, chain)
 
         return wrapper_progress_bar
 
@@ -254,13 +275,13 @@ def progress_bar_factory(num_samples, num_chains):
 
 
 def fori_collect(
-    lower,
-    upper,
-    body_fun,
-    init_val,
-    transform=identity,
-    progbar=True,
-    return_last_val=False,
+    lower: int,
+    upper: int,
+    body_fun: Callable,
+    init_val: Any,
+    transform: Callable = identity,
+    progbar: bool = True,
+    return_last_val: bool = False,
     collection_size=None,
     thinning=1,
     **progbar_opts,
@@ -304,65 +325,91 @@ def fori_collect(
         (upper - lower) // thinning if collection_size is None else collection_size
     )
     assert collection_size >= (upper - lower) // thinning
-    init_val_flat, unravel_fn = ravel_pytree(transform(init_val))
+    init_val_transformed = transform(init_val)
     start_idx = lower + (upper - lower) % thinning
     num_chains = progbar_opts.pop("num_chains", 1)
-    # host_callback does not work yet with multi-GPU platforms
-    # See: https://github.com/google/jax/issues/6447
-    if num_chains > 1 and jax.default_backend() == "gpu":
-        warnings.warn(
-            "We will disable progress bar because it does not work yet on multi-GPUs platforms."
-        )
-        progbar = False
 
+    @partial(maybe_jit, donate_argnums=2)
     @cached_by(fori_collect, body_fun, transform)
-    def _body_fn(i, vals):
-        val, collection, start_idx, thinning = vals
+    def _body_fn(i, val, collection, start_idx, thinning):
         val = body_fun(val)
         idx = (i - start_idx) // thinning
-        collection = cond(
-            idx >= 0,
-            collection,
-            lambda x: x.at[idx].set(ravel_pytree(transform(val))[0]),
-            collection,
-            identity,
-        )
+
+        def update_fn(collect_array, new_val):
+            return cond(
+                idx >= 0,
+                collect_array,
+                lambda x: x.at[idx].set(new_val),
+                collect_array,
+                identity,
+            )
+
+        def update_collection(collection, val):
+            return jax.tree.map(update_fn, collection, transform(val))
+
+        collection = update_collection(collection, val)
         return val, collection, start_idx, thinning
 
-    collection = jnp.zeros((collection_size,) + init_val_flat.shape)
+    def map_fn(x):
+        nx = jnp.asarray(x)
+        return jnp.zeros((collection_size, *nx.shape), dtype=nx.dtype) * nx[None, ...]
+
+    collection = jax.tree.map(map_fn, init_val_transformed)
+
     if not progbar:
-        last_val, collection, _, _ = fori_loop(
-            0, upper, _body_fn, (init_val, collection, start_idx, thinning)
-        )
+
+        def loop_fn(collection):
+            return fori_loop(
+                0,
+                upper,
+                lambda i, vals: _body_fn(i, *vals),
+                (init_val, collection, start_idx, thinning),
+            )
+
+        last_val, collection, _, _ = maybe_jit(loop_fn, donate_argnums=0)(collection)
+
     elif num_chains > 1:
         progress_bar_fori_loop = progress_bar_factory(upper, num_chains)
-        _body_fn_pbar = progress_bar_fori_loop(_body_fn)
-        last_val, collection, _, _ = fori_loop(
-            0, upper, _body_fn_pbar, (init_val, collection, start_idx, thinning)
-        )
+        _body_fn_pbar = progress_bar_fori_loop(lambda i, vals: _body_fn(i, *vals))
+
+        def loop_fn(collection):
+            return fori_loop(
+                0,
+                upper,
+                _body_fn_pbar,
+                ((init_val, collection, start_idx, thinning), -1),  # -1 for chain id
+            )[0]
+
+        last_val, collection, _, _ = maybe_jit(loop_fn, donate_argnums=0)(collection)
+
     else:
         diagnostics_fn = progbar_opts.pop("diagnostics_fn", None)
         progbar_desc = progbar_opts.pop("progbar_desc", lambda x: "")
 
-        vals = (init_val, collection, device_put(start_idx), device_put(thinning))
+        vals = (init_val, collection, jnp.asarray(start_idx), jnp.asarray(thinning))
+
         if upper == 0:
             # special case, only compiling
-            jit(_body_fn)(0, vals)
+            val, collection, start_idx, thinning = vals
+            _, collection, _, _ = _body_fn(-1, val, collection, start_idx, thinning)
+            vals = (val, collection, start_idx, thinning)
         else:
             with tqdm.trange(upper) as t:
                 for i in t:
-                    vals = jit(_body_fn)(i, vals)
+                    vals = _body_fn(i, *vals)
+
                     t.set_description(progbar_desc(i), refresh=False)
                     if diagnostics_fn:
                         t.set_postfix_str(diagnostics_fn(vals[0]), refresh=False)
 
         last_val, collection, _, _ = vals
 
-    unravel_collection = vmap(unravel_fn)(collection)
-    return (unravel_collection, last_val) if return_last_val else unravel_collection
+    return (collection, last_val) if return_last_val else collection
 
 
-def soft_vmap(fn, xs, batch_ndims=1, chunk_size=None):
+def soft_vmap(
+    fn: Callable, xs: Any, batch_ndims: int = 1, chunk_size: Optional[int] = None
+) -> Any:
     """
     Vectorizing map that maps a function `fn` over `batch_ndims` leading axes
     of `xs`. This uses jax.vmap over smaller chunks of the batch dimensions
@@ -376,7 +423,7 @@ def soft_vmap(fn, xs, batch_ndims=1, chunk_size=None):
         Defaults to the size of batch dimensions.
     :returns: output of `fn(xs)`.
     """
-    flatten_xs = tree_flatten(xs)[0]
+    flatten_xs = jax.tree.flatten(xs)[0]
     batch_shape = np.shape(flatten_xs[0])[:batch_ndims]
     for x in flatten_xs[1:]:
         assert np.shape(x)[:batch_ndims] == batch_shape
@@ -384,7 +431,7 @@ def soft_vmap(fn, xs, batch_ndims=1, chunk_size=None):
     # we'll do map(vmap(fn), xs) and make xs.shape = (num_chunks, chunk_size, ...)
     num_chunks = batch_size = int(np.prod(batch_shape))
     prepend_shape = (batch_size,) if batch_size > 1 else ()
-    xs = tree_map(
+    xs = jax.tree.map(
         lambda x: jnp.reshape(x, prepend_shape + jnp.shape(x)[batch_ndims:]), xs
     )
     # XXX: probably for the default behavior with chunk_size=None,
@@ -392,12 +439,12 @@ def soft_vmap(fn, xs, batch_ndims=1, chunk_size=None):
     chunk_size = batch_size if chunk_size is None else min(batch_size, chunk_size)
     if chunk_size > 1:
         pad = chunk_size - (batch_size % chunk_size)
-        xs = tree_map(
+        xs = jax.tree.map(
             lambda x: jnp.pad(x, ((0, pad),) + ((0, 0),) * (np.ndim(x) - 1)), xs
         )
         num_chunks = batch_size // chunk_size + int(pad > 0)
         prepend_shape = (-1,) if num_chunks > 1 else ()
-        xs = tree_map(
+        xs = jax.tree.map(
             lambda x: jnp.reshape(x, prepend_shape + (chunk_size,) + jnp.shape(x)[1:]),
             xs,
         )
@@ -405,21 +452,21 @@ def soft_vmap(fn, xs, batch_ndims=1, chunk_size=None):
 
     ys = lax.map(fn, xs) if num_chunks > 1 else fn(xs)
     map_ndims = int(num_chunks > 1) + int(chunk_size > 1)
-    ys = tree_map(
+    ys = jax.tree.map(
         lambda y: jnp.reshape(
             y, (int(np.prod(jnp.shape(y)[:map_ndims])),) + jnp.shape(y)[map_ndims:]
         )[:batch_size],
         ys,
     )
-    return tree_map(lambda y: jnp.reshape(y, batch_shape + jnp.shape(y)[1:]), ys)
+    return jax.tree.map(lambda y: jnp.reshape(y, batch_shape + jnp.shape(y)[1:]), ys)
 
 
 def format_shapes(
-    trace,
+    trace: dict,
     *,
-    compute_log_prob=False,
-    title="Trace Shapes:",
-    last_site=None,
+    compute_log_prob: bool = False,
+    title: str = "Trace Shapes:",
+    last_site: Optional[str] = None,
 ):
     """
     Given the trace of a function, returns a string showing a table of the shapes of
@@ -443,9 +490,9 @@ def format_shapes(
         def model(*args, **kwargs):
             ...
 
-        with numpyro.handlers.seed(rng_key=1):
+        with numpyro.handlers.seed(rng_seed=1):
             trace = numpyro.handlers.trace(model).get_trace(*args, **kwargs)
-        numpyro.util.format_shapes(trace)
+        print(numpyro.util.format_shapes(trace))
     """
     if not trace.keys():
         return title
@@ -468,7 +515,7 @@ def format_shapes(
             batch_shape = getattr(site["fn"], "batch_shape", ())
             event_shape = getattr(site["fn"], "event_shape", ())
             rows.append(
-                [f"{name} dist", None]
+                [f"{name} dist", None]  # type: ignore[arg-type]
                 + [str(size) for size in batch_shape]
                 + ["|", None]
                 + [str(size) for size in event_shape]
@@ -480,7 +527,7 @@ def format_shapes(
             batch_shape = shape[: len(shape) - event_dim]
             event_shape = shape[len(shape) - event_dim :]
             rows.append(
-                ["value", None]
+                ["value", None]  # type: ignore[arg-type]
                 + [str(size) for size in batch_shape]
                 + ["|", None]
                 + [str(size) for size in event_shape]
@@ -492,14 +539,14 @@ def format_shapes(
             ):
                 batch_shape = getattr(site["fn"].log_prob(site["value"]), "shape", ())
                 rows.append(
-                    ["log_prob", None]
+                    ["log_prob", None]  # type: ignore[arg-type]
                     + [str(size) for size in batch_shape]
                     + ["|", None]
                 )
         elif site["type"] == "plate":
             shape = getattr(site["value"], "shape", ())
             rows.append(
-                [f"{name} plate", None] + [str(size) for size in shape] + ["|", None]
+                [f"{name} plate", None] + [str(size) for size in shape] + ["|", None]  # type: ignore[arg-type]
             )
 
         if name == last_site:
@@ -508,12 +555,51 @@ def format_shapes(
     return _format_table(rows)
 
 
-def check_model_guide_match(model_trace, guide_trace):
+# TODO: follow pyro.util.check_site_shape logics for more complete validation
+def _validate_model(model_trace: dict, plate_warning: str = "loose") -> None:
+    # TODO: Consider exposing global configuration for those strategies.
+    assert plate_warning in ["loose", "strict", "error"]
+    enum_dims = set(
+        [
+            site["infer"]["name_to_dim"][name]
+            for name, site in model_trace.items()
+            if site["type"] == "sample"
+            and site["infer"].get("enumerate") == "parallel"
+            and site["infer"].get("name_to_dim") is not None
+        ]
+    )
+    # Check if plate is missing in the model.
+    for name, site in model_trace.items():
+        if site["type"] == "sample":
+            value_ndim = jnp.ndim(site["value"])
+            batch_shape = lax.broadcast_shapes(
+                tuple(site["fn"].batch_shape),
+                jnp.shape(site["value"])[: value_ndim - len(site["fn"].event_shape)],
+            )
+            plate_dims = set(f.dim for f in site["cond_indep_stack"])
+            batch_ndim = len(batch_shape)
+            for i in range(batch_ndim):
+                dim = -i - 1
+                if batch_shape[dim] > 1 and (dim not in (plate_dims | enum_dims)):
+                    # Skip checking if it is the `scan` dimension.
+                    if dim == -batch_ndim and site.get("_control_flow_done", False):
+                        continue
+                    message = (
+                        f"Missing a plate statement for batch dimension {dim}"
+                        f" at site '{name}'. You can use `numpyro.util.format_shapes`"
+                        " utility to check shapes at all sites of your model."
+                    )
+
+                    if plate_warning == "error":
+                        raise ValueError(message)
+                    elif plate_warning == "strict" or (len(plate_dims) > 0):
+                        warnings.warn(message, stacklevel=find_stack_level())
+
+
+def check_model_guide_match(model_trace: dict, guide_trace: dict) -> None:
     """
-    :param dict model_trace: The model trace to check.
-    :param dict guide_trace: The guide trace to check.
-    :raises: RuntimeWarning, ValueError
     Checks the following assumptions:
+
     1. Each sample site in the model also appears in the guide and is not
         marked auxiliary.
     2. Each sample site in the guide either appears in the model or is marked,
@@ -522,6 +608,10 @@ def check_model_guide_match(model_trace, guide_trace):
         appears in the model.
     4. At each sample site that appears in both the model and guide, the model
         and guide agree on sample shape.
+
+    :param dict model_trace: The model trace to check.
+    :param dict guide_trace: The guide trace to check.
+    :raises: RuntimeWarning, ValueError
     """
     # Check ordinary sample sites.
     guide_vars = set(
@@ -538,27 +628,42 @@ def check_model_guide_match(model_trace, guide_trace):
     model_vars = set(
         name
         for name, site in model_trace.items()
-        if site["type"] == "sample" and not site.get("is_observed", False)
+        if site["type"] == "sample"
+        and not site.get("is_observed", False)
+        and not (
+            name not in guide_trace and site["infer"].get("enumerate") == "parallel"
+        )
     )
-    # TODO: Collect enum variables when TraceEnum_ELBO is supported.
-    enum_vars = set()
+    enum_vars = set(
+        [
+            name
+            for name, site in model_trace.items()
+            if site["type"] == "sample"
+            and not site.get("is_observed", False)
+            and name not in guide_trace
+            and site["infer"].get("enumerate") == "parallel"
+        ]
+    )
 
     if aux_vars & model_vars:
         warnings.warn(
-            "Found auxiliary vars in the model: {}".format(aux_vars & model_vars)
+            "Found auxiliary vars in the model: {}".format(aux_vars & model_vars),
+            stacklevel=find_stack_level(),
         )
     if not (guide_vars <= model_vars | aux_vars):
         warnings.warn(
             "Found non-auxiliary vars in guide but not model, "
             "consider marking these infer={{'is_auxiliary': True}}:\n{}".format(
                 guide_vars - aux_vars - model_vars
-            )
+            ),
+            stacklevel=find_stack_level(),
         )
     if not (model_vars <= guide_vars | enum_vars):
         warnings.warn(
             "Found vars in model but not guide: {}".format(
                 model_vars - guide_vars - enum_vars
-            )
+            ),
+            stacklevel=find_stack_level(),
         )
 
     # Check shapes agree.
@@ -603,7 +708,8 @@ def check_model_guide_match(model_trace, guide_trace):
         warnings.warn(
             "Found plate statements in guide but not model: {}".format(
                 guide_vars - model_vars
-            )
+            ),
+            stacklevel=find_stack_level(),
         )
 
 
@@ -654,14 +760,51 @@ def _format_table(rows):
     )
 
 
-def _versiontuple(version):
+def find_stack_level() -> int:
     """
-    :param str version: Version, in string format.
-    Parse version string into tuple of ints.
+    Find the first place in the stack that is not inside numpyro
+    (tests notwithstanding).
 
-    Only to be used for the standard 'major.minor.patch' format,
-    such as ``'0.2.13'``.
-
-    Source: https://stackoverflow.com/a/11887825/4451315
+    Source:
+    https://github.com/pandas-dev/pandas/blob/ccb25ab1d24c4fb9691270706a59c8d319750870/pandas/util/_exceptions.py#L27-L48
     """
-    return tuple([int(number) for number in version.split(".")])
+    import numpyro
+
+    pkg_dir = os.path.dirname(numpyro.__file__)
+
+    # https://stackoverflow.com/questions/17407119/python-inspect-stack-is-slow
+    frame = inspect.currentframe()
+    n = 0
+    while frame:
+        fname = inspect.getfile(frame)
+        if fname.startswith(pkg_dir):
+            frame = frame.f_back
+            n += 1
+        else:
+            break
+    return n
+
+
+def nested_attrgetter(*collect_fields):
+    """
+    Like attrgetter, but allows for accessing dictionary keys
+    using the dot notation (e.g., 'x.c.d').
+    """
+
+    def getter(obj):
+        results = tuple(_get_nested_attr(obj, field) for field in collect_fields)
+        return results if len(collect_fields) > 1 else results[0]
+
+    return getter
+
+
+def _get_nested_attr(obj, field):
+    """
+    Helper function to recursively access attributes and dictionary keys.
+    """
+    for attr in field.split("."):
+        try:
+            obj = getattr(obj, attr)
+        except AttributeError:
+            obj = obj[attr]
+    return obj

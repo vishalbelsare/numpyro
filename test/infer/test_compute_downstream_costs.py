@@ -2,6 +2,8 @@
 # Copyright (c) 2017-2019 Uber Technologies, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
+from collections import defaultdict
+from functools import partial
 import math
 
 from numpy.testing import assert_allclose
@@ -17,13 +19,15 @@ from numpyro.infer.elbo import (
     _compute_downstream_costs,
     _get_plate_stacks,
     _identify_dense_edges,
+    get_nonreparam_deps,
 )
 
 
 def _brute_force_compute_downstream_costs(
-    model_trace, guide_trace, non_reparam_nodes  #
+    model_trace,
+    guide_trace,
+    non_reparam_nodes,  #
 ):
-
     model_successors = _identify_dense_edges(model_trace)
     guide_successors = _identify_dense_edges(guide_trace)
     guide_nodes = [x for x in guide_trace if guide_trace[x]["type"] == "sample"]
@@ -68,6 +72,33 @@ def _brute_force_compute_downstream_costs(
         downstream_costs[k] = downstream_costs[k].sum_to(
             guide_trace[k]["cond_indep_stack"]
         )
+
+    return downstream_costs, downstream_guide_cost_nodes
+
+
+def _provenance_compute_downstream_costs(
+    model_trace, guide_trace, model_deps, guide_deps
+):
+    # replicate the logic from TraceGraph_ELBO
+    # additionally compute downstream_guide_cost_nodes
+    downstream_costs = defaultdict(lambda: MultiFrameTensor())
+    downstream_guide_cost_nodes = defaultdict(lambda: set())
+    for name, site in model_trace.items():
+        if site["type"] == "sample":
+            # add the log_prob to each non-reparam sample site upstream
+            for key in model_deps[name]:
+                downstream_costs[key].add((site["cond_indep_stack"], site["log_prob"]))
+                downstream_guide_cost_nodes[key] |= {name}
+    for name, site in guide_trace.items():
+        if site["type"] == "sample":
+            # add the -log_prob to each non-reparam sample site upstream
+            for key in guide_deps[name]:
+                downstream_costs[key].add((site["cond_indep_stack"], -site["log_prob"]))
+                downstream_guide_cost_nodes[key] |= {name}
+
+    for node, downstream_cost in downstream_costs.items():
+        guide_site = guide_trace[node]
+        downstream_costs[node] = downstream_cost.sum_to(guide_site["cond_indep_stack"])
 
     return downstream_costs, downstream_guide_cost_nodes
 
@@ -154,28 +185,39 @@ def big_model_guide(
 def test_compute_downstream_costs_big_model_guide_pair(
     include_inner_1, include_single, flip_c23, include_triple, include_z1
 ):
-    seeded_guide = handlers.seed(big_model_guide, rng_seed=0)
-    guide_trace = handlers.trace(seeded_guide).get_trace(
-        include_obs=False,
-        include_inner_1=include_inner_1,
-        include_single=include_single,
-        flip_c23=flip_c23,
-        include_triple=include_triple,
-        include_z1=include_z1,
-    )
-    model_trace = handlers.trace(handlers.replay(seeded_guide, guide_trace)).get_trace(
-        include_obs=True,
-        include_inner_1=include_inner_1,
-        include_single=include_single,
-        flip_c23=flip_c23,
-        include_triple=include_triple,
-        include_z1=include_z1,
-    )
+    def _get_traces_and_deps():
+        model = partial(
+            big_model_guide,
+            include_obs=True,
+            include_inner_1=include_inner_1,
+            include_single=include_single,
+            flip_c23=flip_c23,
+            include_triple=include_triple,
+            include_z1=include_z1,
+        )
+        guide = partial(
+            big_model_guide,
+            include_obs=False,
+            include_inner_1=include_inner_1,
+            include_single=include_single,
+            flip_c23=flip_c23,
+            include_triple=include_triple,
+            include_z1=include_z1,
+        )
 
-    for trace in (model_trace, guide_trace):
-        for site in trace.values():
-            if site["type"] == "sample":
-                site["log_prob"] = site["fn"].log_prob(site["value"])
+        seeded_guide = handlers.seed(guide, rng_seed=0)
+        guide_trace = handlers.trace(seeded_guide).get_trace()
+        model_trace = handlers.trace(handlers.replay(model, guide_trace)).get_trace()
+
+        for trace in (model_trace, guide_trace):
+            for site in trace.values():
+                if site["type"] == "sample":
+                    site["log_prob"] = site["fn"].log_prob(site["value"])
+
+        model_deps, guide_deps = get_nonreparam_deps(model, guide, (), {}, {})
+        return model_trace, guide_trace, model_deps, guide_deps
+
+    model_trace, guide_trace, model_deps, guide_deps = _get_traces_and_deps()
     non_reparam_nodes = set(
         name
         for name, site in guide_trace.items()
@@ -191,7 +233,15 @@ def test_compute_downstream_costs_big_model_guide_pair(
         model_trace, guide_trace, non_reparam_nodes
     )
 
+    dc_provenance, dc_nodes_provenance = _provenance_compute_downstream_costs(
+        model_trace, guide_trace, model_deps, guide_deps
+    )
+
     assert dc_nodes == dc_nodes_brute
+
+    for name, nodes in dc_nodes_provenance.items():
+        assert nodes.issubset(dc_nodes[name])
+        assert nodes == {name}
 
     expected_nodes_full_model = {
         "a1": {"c2", "a1", "d1", "c1", "obs", "b1", "d2", "c3", "b0"},
@@ -305,6 +355,12 @@ def test_compute_downstream_costs_big_model_guide_pair(
     for k in dc:
         assert guide_trace[k]["log_prob"].shape == dc[k].shape
         assert_allclose(dc[k], dc_brute[k], rtol=2e-7)
+        # expected downstream cost provenance
+        expected_dc_provenance = MultiFrameTensor(
+            (model_trace[k]["cond_indep_stack"], model_trace[k]["log_prob"]),
+            (guide_trace[k]["cond_indep_stack"], -guide_trace[k]["log_prob"]),
+        ).sum_to(guide_trace[k]["cond_indep_stack"])
+        assert_allclose(dc_provenance[k], expected_dc_provenance, rtol=1e-7)
 
 
 def plate_reuse_model_guide(include_obs=True, dim1=3, dim2=2):
@@ -329,18 +385,24 @@ def plate_reuse_model_guide(include_obs=True, dim1=3, dim2=2):
 @pytest.mark.parametrize("dim1", [2, 5])
 @pytest.mark.parametrize("dim2", [3, 4])
 def test_compute_downstream_costs_plate_reuse(dim1, dim2):
-    seeded_guide = handlers.seed(plate_reuse_model_guide, rng_seed=0)
-    guide_trace = handlers.trace(seeded_guide).get_trace(
-        include_obs=False, dim1=dim1, dim2=dim2
-    )
-    model_trace = handlers.trace(handlers.replay(seeded_guide, guide_trace)).get_trace(
-        include_obs=True, dim1=dim1, dim2=dim2
-    )
+    def _get_traces_and_deps():
+        model = partial(plate_reuse_model_guide, include_obs=True, dim1=dim1, dim2=dim2)
+        guide = partial(
+            plate_reuse_model_guide, include_obs=False, dim1=dim1, dim2=dim2
+        )
+        seeded_guide = handlers.seed(guide, rng_seed=0)
+        guide_trace = handlers.trace(seeded_guide).get_trace()
+        model_trace = handlers.trace(handlers.replay(model, guide_trace)).get_trace()
 
-    for trace in (model_trace, guide_trace):
-        for site in trace.values():
-            if site["type"] == "sample":
-                site["log_prob"] = site["fn"].log_prob(site["value"])
+        for trace in (model_trace, guide_trace):
+            for site in trace.values():
+                if site["type"] == "sample":
+                    site["log_prob"] = site["fn"].log_prob(site["value"])
+
+        model_deps, guide_deps = get_nonreparam_deps(model, guide, (), {}, {})
+        return model_trace, guide_trace, model_deps, guide_deps
+
+    model_trace, guide_trace, model_deps, guide_deps = _get_traces_and_deps()
     non_reparam_nodes = set(
         name
         for name, site in guide_trace.items()
@@ -356,11 +418,35 @@ def test_compute_downstream_costs_plate_reuse(dim1, dim2):
         model_trace, guide_trace, non_reparam_nodes
     )
 
+    dc_provenance, dc_nodes_provenance = _provenance_compute_downstream_costs(
+        model_trace, guide_trace, model_deps, guide_deps
+    )
+
     assert dc_nodes == dc_nodes_brute
+
+    for name, nodes in dc_nodes_provenance.items():
+        assert nodes.issubset(dc_nodes[name])
+        if name == "c2":
+            assert nodes == {"c2", "obs"}
+        else:
+            assert nodes == {name}
 
     for k in dc:
         assert guide_trace[k]["log_prob"].shape == dc[k].shape
         assert_allclose(dc[k], dc_brute[k], rtol=1e-6)
+        # expected downstream cost provenance
+        expected_dc_provenance = MultiFrameTensor(
+            (model_trace[k]["cond_indep_stack"], model_trace[k]["log_prob"]),
+            (guide_trace[k]["cond_indep_stack"], -guide_trace[k]["log_prob"]),
+        )
+        if k == "c2":
+            expected_dc_provenance.add(
+                (model_trace["obs"]["cond_indep_stack"], model_trace["obs"]["log_prob"])
+            )
+        expected_dc_provenance = expected_dc_provenance.sum_to(
+            guide_trace[k]["cond_indep_stack"]
+        )
+        assert_allclose(dc_provenance[k], expected_dc_provenance, rtol=1e-7)
 
     expected_c1 = model_trace["c1"]["log_prob"] - guide_trace["c1"]["log_prob"]
     expected_c1 += (model_trace["b1"]["log_prob"] - guide_trace["b1"]["log_prob"]).sum()

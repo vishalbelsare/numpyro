@@ -14,7 +14,7 @@ from numpyro.infer.hmc_util import warmup_adapter
 from numpyro.infer.initialization import init_to_uniform
 from numpyro.infer.mcmc import MCMCKernel
 from numpyro.infer.util import initialize_model
-from numpyro.util import identity
+from numpyro.util import identity, is_prng_key
 
 BarkerMHState = namedtuple(
     "BarkerMHState",
@@ -87,7 +87,7 @@ class BarkerMH(MCMCKernel):
     :param bool dense_mass: Whether to use a dense (i.e. full-rank) or diagonal mass matrix.
         (defaults to ``dense_mass=False``).
     :param float target_accept_prob: The target acceptance probability that is used to guide
-        step size adapation. Defaults to ``target_accept_prob=0.4``.
+        step size adaptation. Defaults to ``target_accept_prob=0.4``.
     :param callable init_strategy: a per-site initialization function.
         See :ref:`init_strategy` section for available functions.
 
@@ -132,6 +132,7 @@ class BarkerMH(MCMCKernel):
         self._dense_mass = dense_mass
         self._target_accept_prob = target_accept_prob
         self._init_strategy = init_strategy
+        self._postprocess_fn = None
 
     @property
     def model(self):
@@ -169,7 +170,7 @@ class BarkerMH(MCMCKernel):
     def init(self, rng_key, num_warmup, init_params, model_args, model_kwargs):
         self._num_warmup = num_warmup
         # TODO (low-priority): support chain_method="vectorized", i.e. rng_key is a batch of keys
-        assert rng_key.shape == (2,), (
+        assert is_prng_key(rng_key), (
             "BarkerMH only supports chain_method='parallel' or chain_method='sequential'."
             " Please put in a feature request if you think it would be useful to be able "
             "to use BarkerMH in vectorized mode."
@@ -180,7 +181,7 @@ class BarkerMH(MCMCKernel):
         )
         if self._potential_fn and init_params is None:
             raise ValueError(
-                "Valid value of `init_params` must be provided with" " `potential_fn`."
+                "Valid value of `init_params` must be provided with `potential_fn`."
             )
 
         pe, grad = jax.value_and_grad(self._potential_fn)(init_params)
@@ -207,7 +208,7 @@ class BarkerMH(MCMCKernel):
             wa_state,
             rng_key,
         )
-        return jax.device_put(init_state)
+        return init_state
 
     def postprocess_fn(self, args, kwargs):
         if self._postprocess_fn is None:
@@ -259,7 +260,7 @@ class BarkerMH(MCMCKernel):
                 - softplus(-dx_flat * y_grad_flat_scaled)
             )
         )
-        accept_prob = jnp.clip(jnp.exp(log_accept_ratio), a_max=1.0)
+        accept_prob = jnp.clip(jnp.exp(log_accept_ratio), None, 1.0)
 
         x, x_flat, pe, x_grad = jax.lax.cond(
             random.bernoulli(key_accept, accept_prob),
@@ -288,6 +289,5 @@ class BarkerMH(MCMCKernel):
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        state["_postprocess_fn"] = None
         state["_wa_update"] = None
         return state

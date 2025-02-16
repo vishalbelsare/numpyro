@@ -24,18 +24,20 @@
 # CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
-
 from collections import OrderedDict
 from contextlib import contextmanager
 import functools
 import inspect
+from typing import Any, Protocol, runtime_checkable
 import warnings
 
 import numpy as np
 
+import jax
 from jax import lax, tree_util
 import jax.numpy as jnp
 from jax.scipy.special import logsumexp
+from jax.typing import ArrayLike
 
 from numpyro.distributions.transforms import AbsTransform, ComposeTransform, Transform
 from numpyro.distributions.util import (
@@ -44,7 +46,7 @@ from numpyro.distributions.util import (
     sum_rightmost,
     validate_sample,
 )
-from numpyro.util import not_jax_tracer
+from numpyro.util import find_stack_level, not_jax_tracer
 
 from . import constraints
 
@@ -86,16 +88,17 @@ COERCIONS = []
 
 
 class DistributionMeta(type):
+    def __init__(cls, *args, **kwargs):
+        signature = inspect.signature(functools.partial(cls.__init__, None))
+        cls.__signature__ = signature
+        return super().__init__(*args, **kwargs)
+
     def __call__(cls, *args, **kwargs):
         for coerce_ in COERCIONS:
             result = coerce_(cls, args, kwargs)
             if result is not None:
                 return result
         return super().__call__(*args, **kwargs)
-
-    @property
-    def __wrapped__(cls):
-        return functools.partial(cls.__init__, None)
 
 
 class Distribution(metaclass=DistributionMeta):
@@ -132,24 +135,92 @@ class Distribution(metaclass=DistributionMeta):
     has_enumerate_support = False
     reparametrized_params = []
     _validate_args = False
+    pytree_data_fields = ()
+    pytree_aux_fields = ("_batch_shape", "_event_shape")
 
     # register Distribution as a pytree
-    # ref: https://github.com/google/jax/issues/2916
+    # ref: https://github.com/jax-ml/jax/issues/2916
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         tree_util.register_pytree_node(cls, cls.tree_flatten, cls.tree_unflatten)
 
+    @classmethod
+    def gather_pytree_data_fields(cls):
+        bases = inspect.getmro(cls)
+
+        all_pytree_data_fields = set()
+        for base in bases:
+            if issubclass(base, Distribution):
+                all_pytree_data_fields.update(
+                    base.__dict__.get(
+                        "pytree_data_fields",
+                        tuple(
+                            arg
+                            for arg in base.__dict__.get("arg_constraints", {})
+                            if not isinstance(getattr(cls, arg, None), lazy_property)
+                        ),
+                    )
+                )
+        return tuple(all_pytree_data_fields)
+
+    @classmethod
+    def gather_pytree_aux_fields(cls) -> tuple:
+        bases = inspect.getmro(cls)
+
+        all_pytree_aux_fields = ("_validate_args",)
+        for base in bases:
+            if issubclass(base, Distribution):
+                all_pytree_aux_fields += base.__dict__.get("pytree_aux_fields", ())
+        # remove duplicates
+        all_pytree_aux_fields = tuple(set(all_pytree_aux_fields))
+        return all_pytree_aux_fields
+
     def tree_flatten(self):
+        all_pytree_data_fields_names = type(self).gather_pytree_data_fields()
+        all_pytree_data_fields_vals = tuple(
+            # getattr(self, attr_name) for attr_name in all_pytree_data_fields_names
+            self.__dict__.get(attr_name)
+            for attr_name in all_pytree_data_fields_names
+        )
+        all_pytree_aux_fields_names = type(self).gather_pytree_aux_fields()
+        all_pytree_aux_fields_vals = tuple(
+            # getattr(self, attr_name) for attr_name in all_pytree_aux_fields_names
+            self.__dict__.get(attr_name)
+            for attr_name in all_pytree_aux_fields_names
+        )
         return (
-            tuple(
-                getattr(self, param) for param in sorted(self.arg_constraints.keys())
-            ),
-            None,
+            all_pytree_data_fields_vals,
+            all_pytree_aux_fields_vals,
         )
 
     @classmethod
     def tree_unflatten(cls, aux_data, params):
-        return cls(**dict(zip(sorted(cls.arg_constraints.keys()), params)))
+        pytree_data_fields = cls.gather_pytree_data_fields()
+        pytree_aux_fields = cls.gather_pytree_aux_fields()
+
+        pytree_data_fields_dict = dict(zip(pytree_data_fields, params))
+        pytree_aux_fields_dict = dict(zip(pytree_aux_fields, aux_data))
+
+        d = cls.__new__(cls)
+
+        for k, v in pytree_data_fields_dict.items():
+            if v is not None or not isinstance(getattr(cls, k, None), lazy_property):
+                setattr(d, k, v)
+
+        for k, v in pytree_aux_fields_dict.items():
+            if v is not None or not isinstance(getattr(cls, k, None), lazy_property):
+                setattr(d, k, v)
+
+        # disable args validation during `tree_unflatten` it is called by jax with
+        # placeholder attributes that would make validation fail
+        d._validate_args = False
+        Distribution.__init__(
+            d,
+            pytree_aux_fields_dict["_batch_shape"],
+            pytree_aux_fields_dict["_event_shape"],
+        )
+        d._validate_args = pytree_aux_fields_dict["_validate_args"]
+        return d
 
     @staticmethod
     def set_default_validate_args(value):
@@ -157,31 +228,50 @@ class Distribution(metaclass=DistributionMeta):
             raise ValueError
         Distribution._validate_args = value
 
-    def __init__(self, batch_shape=(), event_shape=(), validate_args=None):
+    def __init__(self, batch_shape=(), event_shape=(), *, validate_args=None):
         self._batch_shape = batch_shape
         self._event_shape = event_shape
         if validate_args is not None:
             self._validate_args = validate_args
         if self._validate_args:
-            for param, constraint in self.arg_constraints.items():
-                if param not in self.__dict__ and isinstance(
-                    getattr(type(self), param), lazy_property
-                ):
-                    continue
-                if constraints.is_dependent(constraint):
-                    continue  # skip constraints that cannot be checked
-                is_valid = constraint(getattr(self, param))
-                if not_jax_tracer(is_valid):
-                    if not np.all(is_valid):
-                        raise ValueError(
-                            "{} distribution got invalid {} parameter.".format(
-                                self.__class__.__name__, param
-                            )
-                        )
+            self.validate_args(strict=False)
         super(Distribution, self).__init__()
 
+    def get_args(self) -> dict:
+        """
+        Get arguments of the distribution.
+        """
+        return {
+            param: getattr(self, param)
+            for param in self.arg_constraints
+            if param in self.__dict__
+            or not isinstance(getattr(type(self), param), lazy_property)
+        }
+
+    def validate_args(self, strict: bool = True) -> None:
+        """
+        Validate the arguments of the distribution.
+
+        :param strict: Require strict validation, raising an error if the function is
+            called inside jitted code.
+        """
+        for param, value in self.get_args().items():
+            constraint = self.arg_constraints[param]
+            if constraints.is_dependent(constraint):
+                continue  # skip constraints that cannot be checked
+            is_valid = constraint(value)
+            if not_jax_tracer(is_valid):
+                if not np.all(is_valid):
+                    raise ValueError(
+                        "{} distribution got invalid {} parameter.".format(
+                            self.__class__.__name__, param
+                        )
+                    )
+            elif strict:
+                raise RuntimeError("Cannot validate arguments inside jitted code.")
+
     @property
-    def batch_shape(self):
+    def batch_shape(self) -> tuple[int, ...]:
         """
         Returns the shape over which the distribution parameters are batched.
 
@@ -191,7 +281,7 @@ class Distribution(metaclass=DistributionMeta):
         return self._batch_shape
 
     @property
-    def event_shape(self):
+    def event_shape(self) -> tuple[int, ...]:
         """
         Returns the shape of a single sample from the distribution without
         batching.
@@ -202,7 +292,7 @@ class Distribution(metaclass=DistributionMeta):
         return self._event_shape
 
     @property
-    def event_dim(self):
+    def event_dim(self) -> int:
         """
         :return: Number of dimensions of individual events.
         :rtype: int
@@ -210,16 +300,16 @@ class Distribution(metaclass=DistributionMeta):
         return len(self.event_shape)
 
     @property
-    def has_rsample(self):
+    def has_rsample(self) -> bool:
         return set(self.reparametrized_params) == set(self.arg_constraints)
 
-    def rsample(self, key, sample_shape=()):
+    def rsample(self, key, sample_shape=()) -> ArrayLike:
         if self.has_rsample:
             return self.sample(key, sample_shape=sample_shape)
 
         raise NotImplementedError
 
-    def shape(self, sample_shape=()):
+    def shape(self, sample_shape=()) -> tuple[int, ...]:
         """
         The tensor shape of samples from this distribution.
 
@@ -234,7 +324,7 @@ class Distribution(metaclass=DistributionMeta):
         """
         return sample_shape + self.batch_shape + self.event_shape
 
-    def sample(self, key, sample_shape=()):
+    def sample(self, key: ArrayLike, sample_shape: tuple[int, ...] = ()) -> ArrayLike:
         """
         Returns a sample from the distribution having shape given by
         `sample_shape + batch_shape + event_shape`. Note that when `sample_shape` is non-empty,
@@ -272,14 +362,14 @@ class Distribution(metaclass=DistributionMeta):
         raise NotImplementedError
 
     @property
-    def mean(self):
+    def mean(self) -> ArrayLike:
         """
         Mean of the distribution.
         """
         raise NotImplementedError
 
     @property
-    def variance(self):
+    def variance(self) -> ArrayLike:
         """
         Variance of the distribution.
         """
@@ -291,7 +381,8 @@ class Distribution(metaclass=DistributionMeta):
             if not np.all(mask):
                 warnings.warn(
                     "Out-of-support values provided to log prob method. "
-                    "The value argument should be within the support."
+                    "The value argument should be within the support.",
+                    stacklevel=find_stack_level(),
                 )
         return mask
 
@@ -322,6 +413,12 @@ class Distribution(metaclass=DistributionMeta):
         """
         Returns an array with shape `len(support) x batch_shape`
         containing all values in the support.
+        """
+        raise NotImplementedError
+
+    def entropy(self):
+        """
+        Returns the entropy of the distribution.
         """
         raise NotImplementedError
 
@@ -437,22 +534,23 @@ class Distribution(metaclass=DistributionMeta):
         # Assumes distribution is univariate.
         batch_shapes = []
         for name, shape in kwargs.items():
-            event_dim = cls.arg_constraints.get(name, constraints.real).event_dim
-            batch_shapes.append(shape[: len(shape) - event_dim])
+            if shape is not None:
+                event_dim = cls.arg_constraints.get(name, constraints.real).event_dim
+                batch_shapes.append(shape[: len(shape) - event_dim])
         batch_shape = lax.broadcast_shapes(*batch_shapes) if batch_shapes else ()
         event_shape = ()
         return batch_shape, event_shape
 
-    def cdf(self, value):
+    def cdf(self, value: ArrayLike) -> ArrayLike:
         """
-        The cummulative distribution function of this distribution.
+        The cumulative distribution function of this distribution.
 
         :param value: samples from this distribution.
-        :return: output of the cummulative distribution function evaluated at `value`.
+        :return: output of the cumulative distribution function evaluated at `value`.
         """
         raise NotImplementedError
 
-    def icdf(self, q):
+    def icdf(self, q: ArrayLike) -> ArrayLike:
         """
         The inverse cumulative distribution function of this distribution.
 
@@ -465,9 +563,58 @@ class Distribution(metaclass=DistributionMeta):
     def is_discrete(self):
         return self.support.is_discrete
 
+    def __repr__(self) -> str:
+        cls = self.__class__
+        return (
+            f"<{cls.__module__}.{cls.__name__} object at {id(self):#x} with batch "
+            f"shape {self.batch_shape} and event shape {self.event_shape}>"
+        )
+
+
+@runtime_checkable
+class DistributionLike(Protocol):
+    """A protocol for typing distributions.
+
+    Used to type object of type numpyro.distributions.Distribution, funsor.Funsor
+    or tensorflow_probability.distributions.Distribution.
+    """
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return super().__call__(*args, **kwargs)
+
+    @property
+    def batch_shape(self) -> tuple[int, ...]: ...
+
+    @property
+    def event_shape(self) -> tuple[int, ...]: ...
+
+    @property
+    def event_dim(self) -> int: ...
+
+    def sample(
+        self, key: ArrayLike, sample_shape: tuple[int, ...] = ()
+    ) -> ArrayLike: ...
+
+    def log_prob(self, value: ArrayLike) -> ArrayLike: ...
+
+    @property
+    def mean(self) -> ArrayLike: ...
+
+    @property
+    def variance(self) -> ArrayLike: ...
+
+    def cdf(self, value: ArrayLike) -> ArrayLike: ...
+
+    def icdf(self, q: ArrayLike) -> ArrayLike: ...
+
 
 class ExpandedDistribution(Distribution):
     arg_constraints = {}
+    pytree_data_fields = ("base_dist",)
+    pytree_aux_fields = (
+        "_expanded_sizes",
+        "_interstitial_sizes",
+    )
 
     def __init__(self, base_dist, batch_shape=()):
         if isinstance(base_dist, ExpandedDistribution):
@@ -514,7 +661,7 @@ class ExpandedDistribution(Distribution):
                 )
         return (
             tuple(reversed(reversed_shape)),
-            OrderedDict(expanded_sizes),
+            OrderedDict(reversed(expanded_sizes)),
             OrderedDict(interstitial_sizes),
         )
 
@@ -532,6 +679,8 @@ class ExpandedDistribution(Distribution):
         batch_shape = expanded_sizes + interstitial_sizes
         # shape = sample_shape + expanded_sizes + interstitial_sizes + base_dist.shape()
         samples, intermediates = sample_fn(key, sample_shape=sample_shape + batch_shape)
+        if not interstitial_sizes:
+            return samples, intermediates
 
         interstitial_dims = tuple(self._interstitial_sizes.keys())
         event_dim = len(self.event_shape)
@@ -556,7 +705,7 @@ class ExpandedDistribution(Distribution):
             event_shape = jnp.shape(x)[batch_ndims:]
             return x.reshape(sample_shape + self.batch_shape + event_shape)
 
-        intermediates = tree_util.tree_map(reshape_sample, intermediates)
+        intermediates = jax.tree.map(reshape_sample, intermediates)
         samples = reshape_sample(samples)
         return samples, intermediates
 
@@ -565,7 +714,7 @@ class ExpandedDistribution(Distribution):
             lambda *args, **kwargs: (self.base_dist.rsample(*args, **kwargs), []),
             key,
             sample_shape,
-        )
+        )[0]
 
     @property
     def support(self):
@@ -577,7 +726,8 @@ class ExpandedDistribution(Distribution):
     def sample(self, key, sample_shape=()):
         return self.sample_with_intermediates(key, sample_shape)[0]
 
-    def log_prob(self, value):
+    def log_prob(self, value, intermediates=None):
+        # TODO: utilize `intermediates`
         shape = lax.broadcast_shapes(
             self.batch_shape,
             jnp.shape(value)[: max(jnp.ndim(value) - self.event_dim, 0)],
@@ -605,23 +755,8 @@ class ExpandedDistribution(Distribution):
             self.base_dist.variance, self.batch_shape + self.event_shape
         )
 
-    def tree_flatten(self):
-        prepend_ndim = len(self.batch_shape) - len(self.base_dist.batch_shape)
-        base_dist = tree_util.tree_map(
-            lambda x: promote_shapes(x, shape=(1,) * prepend_ndim + jnp.shape(x))[0],
-            self.base_dist,
-        )
-        base_flatten, base_aux = base_dist.tree_flatten()
-        return base_flatten, (type(self.base_dist), base_aux, self.batch_shape)
-
-    @classmethod
-    def tree_unflatten(cls, aux_data, params):
-        base_cls, base_aux, batch_shape = aux_data
-        base_dist = base_cls.tree_unflatten(base_aux, params)
-        prepend_shape = base_dist.batch_shape[
-            : len(base_dist.batch_shape) - len(batch_shape)
-        ]
-        return cls(base_dist, batch_shape=prepend_shape + batch_shape)
+    def entropy(self):
+        return jnp.broadcast_to(self.base_dist.entropy(), self.batch_shape)
 
 
 class ImproperUniform(Distribution):
@@ -677,8 +812,9 @@ class ImproperUniform(Distribution):
 
     arg_constraints = {}
     support = constraints.dependent
+    pytree_data_fields = ("support",)
 
-    def __init__(self, support, batch_shape, event_shape, validate_args=None):
+    def __init__(self, support, batch_shape, event_shape, *, validate_args=None):
         self.support = constraints.independent(
             support, len(event_shape) - support.event_dim
         )
@@ -696,15 +832,6 @@ class ImproperUniform(Distribution):
         if batch_dim < jnp.ndim(mask):
             mask = jnp.all(jnp.reshape(mask, jnp.shape(mask)[:batch_dim] + (-1,)), -1)
         return mask
-
-    def tree_flatten(self):
-        raise NotImplementedError(
-            "Cannot flattening ImproperPrior distribution for general supports. "
-            "Please raising a feature request for your specific `support`. "
-            "Alternatively, you can use '.mask(False)' pattern. "
-            "For example, to define an improper prior over positive domain, "
-            "we can use the distribution `dist.LogNormal(0, 1).mask(False)`."
-        )
 
 
 class Independent(Distribution):
@@ -731,8 +858,10 @@ class Independent(Distribution):
     """
 
     arg_constraints = {}
+    pytree_data_fields = ("base_dist",)
+    pytree_aux_fields = ("reinterpreted_batch_ndims",)
 
-    def __init__(self, base_dist, reinterpreted_batch_ndims, validate_args=None):
+    def __init__(self, base_dist, reinterpreted_batch_ndims, *, validate_args=None):
         if reinterpreted_batch_ndims > len(base_dist.batch_shape):
             raise ValueError(
                 "Expected reinterpreted_batch_ndims <= len(base_distribution.batch_shape), "
@@ -761,8 +890,8 @@ class Independent(Distribution):
         return self.base_dist.has_enumerate_support
 
     @property
-    def reparameterized_params(self):
-        return self.base_dist.reparameterized_params
+    def reparametrized_params(self):
+        return self.base_dist.reparametrized_params
 
     @property
     def mean(self):
@@ -794,19 +923,9 @@ class Independent(Distribution):
             self.reinterpreted_batch_ndims
         )
 
-    def tree_flatten(self):
-        base_flatten, base_aux = self.base_dist.tree_flatten()
-        return base_flatten, (
-            type(self.base_dist),
-            base_aux,
-            self.reinterpreted_batch_ndims,
-        )
-
-    @classmethod
-    def tree_unflatten(cls, aux_data, params):
-        base_cls, base_aux, reinterpreted_batch_ndims = aux_data
-        base_dist = base_cls.tree_unflatten(base_aux, params)
-        return cls(base_dist, reinterpreted_batch_ndims)
+    def entropy(self):
+        axes = range(-self.reinterpreted_batch_ndims, 0)
+        return self.base_dist.entropy().sum(axes)
 
 
 class MaskedDistribution(Distribution):
@@ -821,6 +940,8 @@ class MaskedDistribution(Distribution):
     """
 
     arg_constraints = {}
+    pytree_data_fields = ("base_dist", "_mask")
+    pytree_aux_fields = ("_mask",)
 
     def __init__(self, base_dist, mask):
         if isinstance(mask, bool):
@@ -887,22 +1008,30 @@ class MaskedDistribution(Distribution):
         return self.base_dist.variance
 
     def tree_flatten(self):
-        base_flatten, base_aux = self.base_dist.tree_flatten()
+        data, aux = super().tree_flatten()
+        _mask_data_idx = type(self).gather_pytree_data_fields().index("_mask")
+        _mask_aux_idx = type(self).gather_pytree_aux_fields().index("_mask")
+
         if isinstance(self._mask, bool):
-            return base_flatten, (type(self.base_dist), base_aux, self._mask)
+            data = list(data)
+            data[_mask_data_idx] = None
+            data = tuple(data)
         else:
-            return (base_flatten, self._mask), (type(self.base_dist), base_aux)
+            aux = list(aux)
+            aux[_mask_aux_idx] = None
+            aux = tuple(aux)
+        return data, aux
 
     @classmethod
     def tree_unflatten(cls, aux_data, params):
-        if len(aux_data) == 2:
-            base_flatten, mask = params
-            base_cls, base_aux = aux_data
+        d = super().tree_unflatten(aux_data, params)
+        _mask_data_idx = cls.gather_pytree_data_fields().index("_mask")
+        _mask_aux_idx = cls.gather_pytree_aux_fields().index("_mask")
+        if aux_data[_mask_aux_idx] is None:
+            setattr(d, "_mask", params[_mask_data_idx])
         else:
-            base_flatten = params
-            base_cls, base_aux, mask = aux_data
-        base_dist = base_cls.tree_unflatten(base_aux, base_flatten)
-        return cls(base_dist, mask)
+            setattr(d, "_mask", aux_data[_mask_aux_idx])
+        return d
 
 
 class TransformedDistribution(Distribution):
@@ -919,8 +1048,9 @@ class TransformedDistribution(Distribution):
     """
 
     arg_constraints = {}
+    pytree_data_fields = ("base_dist", "transforms")
 
-    def __init__(self, base_distribution, transforms, validate_args=None):
+    def __init__(self, base_distribution, transforms, *, validate_args=None):
         if isinstance(transforms, Transform):
             transforms = [transforms]
         elif isinstance(transforms, list):
@@ -1043,13 +1173,23 @@ class TransformedDistribution(Distribution):
     def variance(self):
         raise NotImplementedError
 
-    def tree_flatten(self):
-        raise NotImplementedError(
-            "Flatenning TransformedDistribution is only supported for some specific cases."
-            " Consider using `TransformReparam` to convert this distribution to the base_dist,"
-            " which is supported in most situtations. In addition, please reach out to us with"
-            " your usage cases."
-        )
+    def cdf(self, value):
+        sign = 1
+        for transform in reversed(self.transforms):
+            sign *= transform.sign
+            value = transform.inv(value)
+        q = self.base_dist.cdf(value)
+        return jnp.where(sign < 0, 1 - q, q)
+
+    def icdf(self, q):
+        sign = 1
+        for transform in self.transforms:
+            sign *= transform.sign
+        q = jnp.where(sign < 0, 1 - q, q)
+        value = self.base_dist.icdf(q)
+        for transform in self.transforms:
+            value = transform(value)
+        return value
 
 
 class FoldedDistribution(TransformedDistribution):
@@ -1062,7 +1202,7 @@ class FoldedDistribution(TransformedDistribution):
 
     support = constraints.positive
 
-    def __init__(self, base_dist, validate_args=None):
+    def __init__(self, base_dist, *, validate_args=None):
         if base_dist.event_shape:
             raise ValueError("Only univariate distributions can be folded.")
         super().__init__(base_dist, AbsTransform(), validate_args=validate_args)
@@ -1073,16 +1213,6 @@ class FoldedDistribution(TransformedDistribution):
         plus_minus = jnp.array([1.0, -1.0]).reshape((2,) + (1,) * dim)
         return logsumexp(self.base_dist.log_prob(plus_minus * value), axis=0)
 
-    def tree_flatten(self):
-        base_flatten, base_aux = self.base_dist.tree_flatten()
-        return base_flatten, (type(self.base_dist), base_aux)
-
-    @classmethod
-    def tree_unflatten(cls, aux_data, params):
-        base_cls, base_aux = aux_data
-        base_dist = base_cls.tree_unflatten(base_aux, params)
-        return cls(base_dist)
-
 
 class Delta(Distribution):
     arg_constraints = {
@@ -1091,7 +1221,7 @@ class Delta(Distribution):
     }
     reparametrized_params = ["v", "log_density"]
 
-    def __init__(self, v=0.0, log_density=0.0, event_dim=0, validate_args=None):
+    def __init__(self, v=0.0, log_density=0.0, event_dim=0, *, validate_args=None):
         if event_dim > jnp.ndim(v):
             raise ValueError(
                 "Expected event_dim <= v.dim(), actual {} vs {}".format(
@@ -1113,12 +1243,14 @@ class Delta(Distribution):
         return constraints.independent(constraints.real, self.event_dim)
 
     def sample(self, key, sample_shape=()):
+        if not sample_shape:
+            return self.v
         shape = sample_shape + self.batch_shape + self.event_shape
         return jnp.broadcast_to(self.v, shape)
 
     @validate_sample
     def log_prob(self, value):
-        log_prob = jnp.log(value == self.v)
+        log_prob = jnp.where(value == self.v, 0, -jnp.inf)
         log_prob = sum_rightmost(log_prob, len(self.event_shape))
         return log_prob + self.log_density
 
@@ -1130,12 +1262,8 @@ class Delta(Distribution):
     def variance(self):
         return jnp.zeros(self.batch_shape + self.event_shape)
 
-    def tree_flatten(self):
-        return (self.v, self.log_density), self.event_dim
-
-    @classmethod
-    def tree_unflatten(cls, aux_data, params):
-        return cls(*params, event_dim=aux_data)
+    def entropy(self):
+        return -jnp.broadcast_to(self.log_density, self.batch_shape)
 
 
 class Unit(Distribution):
@@ -1150,7 +1278,7 @@ class Unit(Distribution):
     arg_constraints = {"log_factor": constraints.real}
     support = constraints.real
 
-    def __init__(self, log_factor, validate_args=None):
+    def __init__(self, log_factor, *, validate_args=None):
         batch_shape = jnp.shape(log_factor)
         event_shape = (0,)  # This satisfies .size == 0.
         self.log_factor = log_factor

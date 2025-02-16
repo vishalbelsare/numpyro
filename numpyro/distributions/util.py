@@ -4,6 +4,7 @@
 from collections import namedtuple
 from functools import partial, update_wrapper
 import math
+import warnings
 
 import numpy as np
 
@@ -11,6 +12,10 @@ import jax
 from jax import jit, lax, random, vmap
 import jax.numpy as jnp
 from jax.scipy.linalg import solve_triangular
+from jax.scipy.special import digamma
+from jax.typing import ArrayLike
+
+from numpyro.util import not_jax_tracer
 
 # Parameters for Transformed Rejection with Squeeze (TRS) algorithm - page 3.
 _tr_params = namedtuple(
@@ -62,6 +67,9 @@ def stirling_approx_tail(k):
     )
 
 
+_binomial_mu_thresh = 10
+
+
 def _binomial_btrs(key, p, n):
     """
     Based on the transformed rejection sampling algorithm (BTRS) from the
@@ -103,13 +111,19 @@ def _binomial_btrs(key, p, n):
         k, key, u, v = val
         early_accept = (jnp.abs(u) <= tr_params.u_r) & (v <= tr_params.v_r)
         early_reject = (k < 0) | (k > n)
-        return lax.cond(
+        # when vmapped _binomial_dispatch will convert the cond condition into
+        # a HLO select that will execute both branches. This is a workaround
+        # that avoids the resulting infinite loop when p=0. This should also
+        # improve performance in less catastrophic cases.
+        cond_exclude_small_mu = p * n >= _binomial_mu_thresh
+        cond_main = lax.cond(
             early_accept | early_reject,
             (),
             lambda _: ~early_accept,
             (k, u, v),
             lambda x: ~accept_fn(*x),
         )
+        return cond_exclude_small_mu & cond_main
 
     tr_params = _get_tr_params(n, p)
     ret = lax.while_loop(
@@ -129,9 +143,15 @@ def _binomial_inversion(key, p, n):
 
     def _binom_inv_cond_fn(val):
         i, _, geom_acc = val
-        return geom_acc <= n
+        # see the note on cond_exclude_small_mu in _binomial_btrs
+        # this cond_exclude_large_mu is unnecessary for correctness but will
+        # still improve performance.
+        cond_exclude_large_mu = p * n < _binomial_mu_thresh
+        return cond_exclude_large_mu & (geom_acc <= n)
 
     log1_p = jnp.log1p(-p)
+    # Make sure p=0 is never taken into account as a fix for possible zeros in p.
+    log1_p = jnp.where(log1_p == 0, -jnp.finfo(log1_p.dtype).tiny, log1_p)
     ret = lax.while_loop(_binom_inv_cond_fn, _binom_inv_body_fn, (-1, key, 0.0))
     return ret[0]
 
@@ -142,7 +162,7 @@ def _binomial_dispatch(key, p, n):
         pq = jnp.where(is_le_mid, p, 1 - p)
         mu = n * pq
         k = lax.cond(
-            mu < 10,
+            mu < _binomial_mu_thresh,
             (key, pq, n),
             lambda x: _binomial_inversion(*x),
             (key, pq, n),
@@ -185,6 +205,8 @@ def _categorical(key, p, shape):
     # Ref: https://stackoverflow.com/a/34190035
     shape = shape or p.shape[:-1]
     s = jnp.cumsum(p, axis=-1)
+    # Normalize s to deal with numerical issues.
+    s = s[..., :-1] / s[..., -1:]
     r = random.uniform(key, shape=shape + (1,))
     # FIXME: replace this computation by using binary search as suggested in the above
     # reference. A while_loop + vmap for a reshaped 2D array would be enough.
@@ -245,11 +267,15 @@ def _multinomial(key, p, n, n_max, shape=()):
     return jnp.reshape(samples_2D, shape + p.shape[-1:]) - excess
 
 
-def multinomial(key, p, n, shape=()):
-    assert not isinstance(
-        n, jax.core.Tracer
-    ), "The total count parameter `n` should not be a jax abstract array."
-    n_max = int(np.max(jax.device_get(n)))
+def multinomial(key, p, n, shape=(), total_count_max=None):
+    if total_count_max is None:
+        if isinstance(n, jax.core.Tracer):
+            raise ValueError(
+                "Please specify total_count_max in Multinomial distribution."
+            )
+        n_max = int(np.max(jax.device_get(n)))
+    else:
+        n_max = total_count_max
     return _multinomial(key, p, n, n_max, shape)
 
 
@@ -365,14 +391,14 @@ def cholesky_update(L, x, coef=1):
 def signed_stick_breaking_tril(t):
     # make sure that t in (-1, 1)
     eps = jnp.finfo(t.dtype).eps
-    t = jnp.clip(t, a_min=(-1 + eps), a_max=(1 - eps))
+    t = jnp.clip(t, -1 + eps, 1 - eps)
     # transform t to tril matrix with identity diagonal
     r = vec_to_tril_matrix(t, diagonal=-1)
 
     # apply stick-breaking on the squared values;
     # we omit the step of computing s = z * z_cumprod by using the fact:
     #     y = sign(r) * s = sign(r) * sqrt(z * z_cumprod) = r * sqrt(z_cumprod)
-    z = r ** 2
+    z = r**2
     z1m_cumprod_sqrt = jnp.cumprod(jnp.sqrt(1 - z), axis=-1)
 
     pad_width = [(0, 0)] * z.ndim
@@ -380,7 +406,7 @@ def signed_stick_breaking_tril(t):
     z1m_cumprod_sqrt_shifted = jnp.pad(
         z1m_cumprod_sqrt[..., :-1], pad_width, mode="constant", constant_values=1.0
     )
-    y = (r + jnp.identity(r.shape[-1])) * z1m_cumprod_sqrt_shifted
+    y = add_diag(r, 1) * z1m_cumprod_sqrt_shifted
     return y
 
 
@@ -394,9 +420,107 @@ def logmatmulexp(x, y):
     return xy + x_shift + y_shift
 
 
+@jax.custom_jvp
+def log1mexp(x: ArrayLike) -> ArrayLike:
+    """
+    Numerically stable calculation of the quantity
+    :math:`\\log(1 - \\exp(x))`, following the algorithm
+    of `Mächler 2012`_.
+
+    .. _Mächler 2012: https://cran.r-project.org/web/packages/Rmpfr/vignettes/log1mexp-note.pdf
+
+    Returns ``-jnp.inf`` when ``x == 0`` and ``jnp.nan``
+    when ``x > 0``.
+
+    :param x: A number or array of numbers.
+    :return: The value of :math:`\\log(1 - \\exp(x))`.
+    """
+    return jnp.where(
+        x > -0.6931472,  # approx log(2)
+        jnp.log(-jnp.expm1(x)),
+        jnp.log1p(-jnp.exp(x)),
+    )
+
+
+# Custom jvp for log1mexp to handle the gradient when x is near 0.
+#
+# Inspired by the approach taken here for the function log1mexp(-x):
+# https://github.com/google-research/google-research/blob/14e984cdb8630a7e3d210dff8760fc06d490fc4b/diffusion_distillation/diffusion_distillation/utils.py#L364-L370
+# That code is (c) 2024 The Google Research Authors and licensed under
+# an Apache 2.0 License.
+log1mexp.defjvps(lambda t, ans, x: -t / jnp.expm1(-x))
+
+
+def logdiffexp(a: ArrayLike, b: ArrayLike) -> ArrayLike:
+    """
+    Numerically stable calculation of the
+    quantity :math:`\\log(\\exp(a) - \\exp(b))`,
+    provided :math:`+\\infty > a \\ge b`,
+    following the algorithm of `Mächler 2012`_.
+
+    .. _Mächler 2012: https://cran.r-project.org/web/packages/Rmpfr/vignettes/log1mexp-note.pdf
+
+    Returns ``-jnp.inf`` when ``a == b``,
+    including when ``a == b == -jnp.inf``,
+    since this corresponds to ``jnp.log(0)``.
+    Returns ``jnp.nan`` when ``a < b`` or
+    ``a == jnp.inf``.
+
+    :param a: A number or array of numbers.
+    :param b: A number or array of numbers.
+    :return: The value of :math:`\\log(\\exp(a) - \\exp(b))`.
+    """
+    return jnp.where(
+        (a < jnp.inf) & (a > b),
+        a + log1mexp(b - a),
+        jnp.where(a == b, -jnp.inf, jnp.nan),
+    )
+
+
 def clamp_probs(probs):
     finfo = jnp.finfo(jnp.result_type(probs, float))
-    return jnp.clip(probs, a_min=finfo.tiny, a_max=1.0 - finfo.eps)
+    return jnp.clip(probs, finfo.tiny, 1.0 - finfo.eps)
+
+
+def betainc(a, b, x):
+    try:
+        from tensorflow_probability.substrates.jax.math import betainc as betainc_fn
+    except ImportError:
+        from jax.scipy.special import betainc as betainc_fn
+
+    dtype = jnp.result_type(float)
+    return betainc_fn(
+        jnp.array(a, dtype=dtype),
+        jnp.array(b, dtype=dtype),
+        jnp.array(x, dtype=dtype),
+    )
+
+
+def betaincinv(a, b, y):
+    try:
+        from tensorflow_probability.substrates.jax.math import special as tfp_special
+    except ImportError as e:
+        raise ImportError(
+            "Please install `tensorflow_probability>=0.18` for betaincinv."
+        ) from e
+
+    dtype = jnp.result_type(float)
+    return tfp_special.betaincinv(
+        jnp.array(a, dtype=dtype),
+        jnp.array(b, dtype=dtype),
+        jnp.array(y, dtype=dtype),
+    )
+
+
+def gammaincinv(a, y):
+    try:
+        from tensorflow_probability.substrates.jax import math as tfp_math
+
+        return tfp_math.igammainv(jnp.array(a), jnp.array(y))
+    except ImportError as e:
+        raise ImportError(
+            "Please install `tensorflow_probability>=0.18` for gammaincinv."
+        ) from e
 
 
 def is_identically_zero(x):
@@ -453,9 +577,9 @@ def _von_mises_centered(key, concentration, shape, dtype):
     }
     s_cutoff = s_cutoff_map.get(dtype)
 
-    r = 1.0 + jnp.sqrt(1.0 + 4.0 * concentration ** 2)
+    r = 1.0 + jnp.sqrt(1.0 + 4.0 * concentration**2)
     rho = (r - jnp.sqrt(2.0 * r)) / (2.0 * concentration)
-    s_exact = (1.0 + rho ** 2) / (2.0 * rho)
+    s_exact = (1.0 + rho**2) / (2.0 * rho)
 
     s_approximate = 1.0 / concentration
 
@@ -545,19 +669,46 @@ def safe_normalize(x, *, p=2):
     assert isinstance(p, (float, int))
     assert p >= 0
     norm = jnp.linalg.norm(x, p, axis=-1, keepdims=True)
-    x = x / jnp.clip(norm, a_min=jnp.finfo(x).tiny)
+    x = x / jnp.clip(norm, jnp.finfo(x).tiny)
     # Avoid the singularity.
     mask = jnp.all(x == 0, axis=-1, keepdims=True)
     x = jnp.where(mask, x.shape[-1] ** (-1 / p), x)
     return x
 
 
-# src: https://github.com/google/jax/blob/5a41779fbe12ba7213cd3aa1169d3b0ffb02a094/jax/_src/random.py#L95
 def is_prng_key(key):
+    warnings.warn("Please use numpyro.util.is_prng_key.", DeprecationWarning)
     try:
+        if jax.dtypes.issubdtype(key.dtype, jax.dtypes.prng_key):
+            return key.shape == ()
         return key.shape == (2,) and key.dtype == np.uint32
     except AttributeError:
         return False
+
+
+def assert_one_of(**kwargs):
+    """
+    Assert that exactly one of the keyword arguments is not None.
+    """
+    specified = [key for key, value in kwargs.items() if value is not None]
+    if len(specified) != 1:
+        raise ValueError(
+            f"Exactly one of {list(kwargs)} must be specified; got {specified}."
+        )
+
+
+def multidigamma(a: jnp.ndarray, d: jnp.ndarray) -> jnp.ndarray:
+    """
+    Derivative of the log of multivariate gamma.
+    """
+    return digamma(a[..., None] - 0.5 * jnp.arange(d)).sum(axis=-1)
+
+
+def tri_logabsdet(a: jnp.ndarray) -> jnp.ndarray:
+    """
+    Evaluate the `logabsdet` of a triangular positive-definite matrix.
+    """
+    return jnp.log(jnp.diagonal(a, axis1=-1, axis2=-2)).sum(axis=-1)
 
 
 # The is sourced from: torch.distributions.util.py
@@ -603,13 +754,14 @@ class lazy_property(object):
         if instance is None:
             return self
         value = self.wrapped(instance)
-        setattr(instance, self.wrapped.__name__, value)
+        if not_jax_tracer(value):
+            setattr(instance, self.wrapped.__name__, value)
         return value
 
 
 def validate_sample(log_prob_fn):
     def wrapper(self, *args, **kwargs):
-        log_prob = log_prob_fn(self, *args, *kwargs)
+        log_prob = log_prob_fn(self, *args, **kwargs)
         if self._validate_args:
             value = kwargs["value"] if "value" in kwargs else args[0]
             mask = self._validate_sample(value)
@@ -617,3 +769,11 @@ def validate_sample(log_prob_fn):
         return log_prob
 
     return wrapper
+
+
+def add_diag(matrix: jnp.ndarray, diag: jnp.ndarray) -> jnp.ndarray:
+    """
+    Add `diag` to the trailing diagonal of `matrix`.
+    """
+    idx = jnp.arange(matrix.shape[-1])
+    return matrix.at[..., idx, idx].add(diag)

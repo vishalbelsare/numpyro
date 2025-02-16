@@ -3,7 +3,7 @@
 
 from collections import namedtuple
 
-from jax import device_put, lax, random, vmap
+from jax import lax, random, vmap
 from jax.flatten_util import ravel_pytree
 import jax.numpy as jnp
 from jax.scipy.special import logsumexp
@@ -12,7 +12,7 @@ import numpyro.distributions as dist
 from numpyro.distributions.util import cholesky_update
 from numpyro.infer.mcmc import MCMCKernel
 from numpyro.infer.util import init_to_uniform, initialize_model
-from numpyro.util import identity
+from numpyro.util import identity, is_prng_key
 
 
 def _get_proposal_loc_and_scale(samples, loc, scale, new_sample):
@@ -25,12 +25,12 @@ def _get_proposal_loc_and_scale(samples, loc, scale, new_sample):
         new_scale = cholesky_update(scale, new_sample - loc, weight)
         proposal_scale = cholesky_update(new_scale, samples - loc, -weight)
         proposal_scale = cholesky_update(
-            proposal_scale, new_sample - samples, -(weight ** 2)
+            proposal_scale, new_sample - samples, -(weight**2)
         )
     else:
         var = jnp.square(scale) + weight * jnp.square(new_sample - loc)
         proposal_var = var - weight * jnp.square(samples - loc)
-        proposal_var = proposal_var - weight ** 2 * jnp.square(new_sample - samples)
+        proposal_var = proposal_var - weight**2 * jnp.square(new_sample - samples)
         proposal_scale = jnp.sqrt(proposal_var)
 
     proposal_loc = loc + weight * (new_sample - samples)
@@ -110,8 +110,9 @@ def _sa(potential_fn=None, potential_fn_gen=None):
         dense_mass=False,
         model_args=(),
         model_kwargs=None,
-        rng_key=random.PRNGKey(0),
+        rng_key=None,
     ):
+        rng_key = random.PRNGKey(0) if rng_key is None else rng_key
         nonlocal wa_steps
         wa_steps = num_warmup
         pe_fn = potential_fn
@@ -173,7 +174,7 @@ def _sa(potential_fn=None, potential_fn_gen=None):
             adapt_state,
             rng_key_sa,
         )
-        return device_put(sa_state)
+        return sa_state
 
     def sample_kernel(sa_state, model_args=(), model_kwargs=None):
         pe_fn = potential_fn
@@ -330,7 +331,7 @@ class SA(MCMCKernel):
         self, rng_key, num_warmup, init_params=None, model_args=(), model_kwargs={}
     ):
         # non-vectorized
-        if rng_key.ndim == 1:
+        if is_prng_key(rng_key):
             rng_key, rng_key_init_model = random.split(rng_key)
         # vectorized
         else:
@@ -344,7 +345,7 @@ class SA(MCMCKernel):
         )
         if self._potential_fn and init_params is None:
             raise ValueError(
-                "Valid value of `init_params` must be provided with" " `potential_fn`."
+                "Valid value of `init_params` must be provided with `potential_fn`."
             )
 
         # NB: init args is different from HMC
@@ -357,7 +358,7 @@ class SA(MCMCKernel):
             model_args=model_args,
             model_kwargs=model_kwargs,
         )
-        if rng_key.ndim == 1:
+        if is_prng_key(rng_key):
             init_state = sa_init_fn(init_params, rng_key)
         else:
             init_state = vmap(sa_init_fn)(init_params, rng_key)
@@ -401,6 +402,4 @@ class SA(MCMCKernel):
         state = self.__dict__.copy()
         state["_sample_fn"] = None
         state["_init_fn"] = None
-        state["_postprocess_fn"] = None
-        state["_potential_fn_gen"] = None
         return state

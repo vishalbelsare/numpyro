@@ -9,14 +9,19 @@ import warnings
 
 import numpy as np
 
-from jax import jit, lax, local_device_count, pmap, random, vmap
-from jax.core import Tracer
-from jax.interpreters.xla import DeviceArray
+import jax
+from jax import device_get, jit, lax, local_device_count, pmap, random, vmap
 import jax.numpy as jnp
-from jax.tree_util import tree_flatten, tree_map, tree_multimap
 
 from numpyro.diagnostics import print_summary
-from numpyro.util import cached_by, fori_collect, identity
+from numpyro.util import (
+    cached_by,
+    find_stack_level,
+    fori_collect,
+    identity,
+    is_prng_key,
+    nested_attrgetter,
+)
 
 __all__ = [
     "MCMCKernel",
@@ -135,6 +140,16 @@ class MCMCKernel(ABC):
         """
         return (self.sample_field,)
 
+    @property
+    def is_ensemble_kernel(self):
+        """
+        Denotes whether the kernel is an ensemble kernel. If True,
+        diagnostics_str will be displayed during the MCMC run
+        (when :meth:`MCMC.run() <numpyro.infer.MCMC.run>` is called)
+        if `chain_method` = "vectorized".
+        """
+        return False
+
     def get_diagnostics_str(self, state):
         """
         Given the current `state`, returns the diagnostics string to
@@ -150,18 +165,18 @@ def _get_progbar_desc_str(num_warmup, phase, i):
 
 
 def _get_value_from_index(xs, i):
-    return tree_map(lambda x: x[i], xs)
+    return jax.tree.map(lambda x: x[i], xs)
 
 
 def _laxmap(f, xs):
-    n = tree_flatten(xs)[0][0].shape[0]
+    n = jax.tree.flatten(xs)[0][0].shape[0]
 
     ys = []
     for i in range(n):
         x = jit(_get_value_from_index)(xs, i)
         ys.append(f(x))
 
-    return tree_multimap(lambda *args: jnp.stack(args), *ys)
+    return jax.tree.map(lambda *args: jnp.stack(args), *ys)
 
 
 def _sample_fn_jit_args(state, sampler):
@@ -174,26 +189,35 @@ def _sample_fn_nojit_args(state, sampler, args, kwargs):
     return (sampler.sample(state[0], args, kwargs),)
 
 
-def _collect_fn(collect_fields):
-    @cached_by(_collect_fn, collect_fields)
-    def collect(x):
+def _collect_and_postprocess(postprocess_fn, collect_fields, remove_sites):
+    @cached_by(_collect_and_postprocess, postprocess_fn, collect_fields, remove_sites)
+    def collect_and_postprocess(x):
         if collect_fields:
-            return attrgetter(*collect_fields)(x[0])
+            fields = nested_attrgetter(*collect_fields)(x[0])
+            fields = [fields] if len(collect_fields) == 1 else list(fields)
+            fields[0] = postprocess_fn(fields[0], *x[1:])
+
+            if remove_sites != ():
+                assert isinstance(fields[0], dict)
+
+                sample_sites = fields[0].copy()
+                for site in remove_sites:
+                    sample_sites.pop(site)
+                fields[0] = sample_sites
+
+            fields = fields[0] if len(collect_fields) == 1 else fields
+            return fields
         else:
             return x[0]
 
-    return collect
+    return collect_and_postprocess
 
 
 # XXX: Is there a better hash key that we can use?
 def _hashable(x):
-    # When the arguments are JITed, ShapedArray is hashable.
-    if isinstance(x, Tracer):
-        return x
-    elif isinstance(x, DeviceArray):
-        return x.copy().tobytes()
-    elif isinstance(x, (np.ndarray, jnp.ndarray)):
-        return x.tobytes()
+    # NOTE: When the arguments are JITed, ShapedArray is hashable.
+    if isinstance(x, (np.ndarray, jnp.ndarray)):
+        return id(x)
     return x
 
 
@@ -212,6 +236,34 @@ class MCMC(object):
         correctly. If you are using Jupyter Notebook or Jupyter Lab, please also install the
         corresponding extension package like `widgetsnbextension` or `jupyterlab_widgets`.
 
+    .. note:: If your dataset is large and you have access to multiple acceleration devices,
+        you can distribute the computation across multiple devices. Make sure that your jax version
+        is v0.4.4 or newer. For example,
+
+        .. code-block:: python
+
+            import jax
+            from jax.experimental import mesh_utils
+            from jax.sharding import PositionalSharding
+            import numpy as np
+            import numpyro
+            import numpyro.distributions as dist
+            from numpyro.infer import MCMC, NUTS
+
+            X = np.random.randn(128, 3)
+            y = np.random.randn(128)
+
+            def model(X, y):
+                beta = numpyro.sample("beta", dist.Normal(0, 1).expand([3]))
+                numpyro.sample("obs", dist.Normal(X @ beta, 1), obs=y)
+
+            mcmc = MCMC(NUTS(model), num_warmup=10, num_samples=10)
+            # See https://jax.readthedocs.io/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html
+            sharding = PositionalSharding(mesh_utils.create_device_mesh((8,)))
+            X_shard = jax.device_put(X, sharding.reshape(8, 1))
+            y_shard = jax.device_put(y, sharding.reshape(8))
+            mcmc.run(jax.random.PRNGKey(0), X_shard, y_shard)
+
     :param MCMCKernel sampler: an instance of :class:`~numpyro.infer.mcmc.MCMCKernel` that
         determines the sampler for running MCMC. Currently, only :class:`~numpyro.infer.hmc.HMC`
         and :class:`~numpyro.infer.hmc.NUTS` are available.
@@ -227,7 +279,8 @@ class MCMC(object):
         sample values returned from the sampler to constrained values that lie within the support
         of the sample sites. Additionally, this is used to return values at deterministic sites in
         the model.
-    :param str chain_method: One of 'parallel' (default), 'sequential', 'vectorized'. The method
+    :param str chain_method: A callable jax transform like `jax.vmap` or one of
+        'parallel' (default), 'sequential', 'vectorized'. The method
         'parallel' is used to execute the drawing process in parallel on XLA devices (CPUs/GPUs/TPUs),
         If there are not enough devices for 'parallel', we fall back to 'sequential' method to draw
         chains sequentially. 'vectorized' method is an experimental feature which vectorizes the
@@ -290,7 +343,11 @@ class MCMC(object):
             raise ValueError("thinning must be a positive integer")
         self.thinning = thinning
         self.postprocess_fn = postprocess_fn
-        if chain_method not in ["parallel", "vectorized", "sequential"]:
+        if not callable(chain_method) and chain_method not in [
+            "parallel",
+            "vectorized",
+            "sequential",
+        ]:
             raise ValueError(
                 "Only supporting the following methods to draw chains:"
                 ' "sequential", "parallel", or "vectorized"'
@@ -304,9 +361,16 @@ class MCMC(object):
                 " of your program. You can double-check how many devices are available in"
                 " your system using `jax.local_device_count()`.".format(
                     self.num_chains, local_device_count(), self.num_chains
-                )
+                ),
+                stacklevel=find_stack_level(),
             )
         self.chain_method = chain_method
+        if callable(chain_method) and (num_chains > 1) and progress_bar:
+            warnings.warn(
+                "Disabling progress bar as `chain_method` is a callable and `num_chains > 1`.",
+                stacklevel=find_stack_level(),
+            )
+            progress_bar = False
         self.progress_bar = progress_bar
         if "CI" in os.environ or "PYTEST_XDIST_WORKER" in os.environ:
             self.progress_bar = False
@@ -327,8 +391,8 @@ class MCMC(object):
         if self._jit_model_args:
             args, kwargs = (None,), (None,)
         else:
-            args = tree_map(lambda x: _hashable(x), self._args)
-            kwargs = tree_map(
+            args = jax.tree.map(lambda x: _hashable(x), self._args)
+            kwargs = jax.tree.map(
                 lambda x: _hashable(x), tuple(sorted(self._kwargs.items()))
             )
         key = args + kwargs
@@ -340,19 +404,33 @@ class MCMC(object):
             fns, key = None, None
         if fns is None:
 
-            def laxmap_postprocess_fn(states, args, kwargs):
+            def ensure_vmap(fn, batch_size=None):
+                def wrapper(x):
+                    x_arrays = jax.tree.flatten(x)[0]
+                    if len(x_arrays) > 0:
+                        return vmap(fn)(x)
+                    else:
+                        assert batch_size is not None
+                        return jax.tree.map(
+                            lambda x: jnp.broadcast_to(x, (batch_size,) + jnp.shape(x)),
+                            fn(x),
+                        )
+
+                return wrapper
+
+            def _postprocess_fn(state, args, kwargs):
                 if self.postprocess_fn is None:
                     body_fn = self.sampler.postprocess_fn(args, kwargs)
                 else:
                     body_fn = self.postprocess_fn
                 if self.chain_method == "vectorized" and self.num_chains > 1:
-                    body_fn = vmap(body_fn)
+                    body_fn = ensure_vmap(body_fn, batch_size=self.num_chains)
 
-                return lax.map(body_fn, states)
+                return body_fn(state)
 
             if self._jit_model_args:
                 sample_fn = partial(_sample_fn_jit_args, sampler=self.sampler)
-                postprocess_fn = jit(laxmap_postprocess_fn)
+                postprocess_fn = _postprocess_fn
             else:
                 sample_fn = partial(
                     _sample_fn_nojit_args,
@@ -360,8 +438,8 @@ class MCMC(object):
                     args=self._args,
                     kwargs=self._kwargs,
                 )
-                postprocess_fn = jit(
-                    partial(laxmap_postprocess_fn, args=self._args, kwargs=self._kwargs)
+                postprocess_fn = partial(
+                    _postprocess_fn, args=self._args, kwargs=self._kwargs
                 )
 
             fns = sample_fn, postprocess_fn
@@ -371,8 +449,8 @@ class MCMC(object):
 
     def _get_cached_init_state(self, rng_key, args, kwargs):
         rng_key = (_hashable(rng_key),)
-        args = tree_map(lambda x: _hashable(x), args)
-        kwargs = tree_map(lambda x: _hashable(x), tuple(sorted(kwargs.items())))
+        args = jax.tree.map(lambda x: _hashable(x), args)
+        kwargs = jax.tree.map(lambda x: _hashable(x), tuple(sorted(kwargs.items())))
         key = rng_key + args + kwargs
         try:
             return self._init_state_cache.get(key, None)
@@ -380,22 +458,24 @@ class MCMC(object):
         except TypeError:
             return None
 
-    def _single_chain_mcmc(self, init, args, kwargs, collect_fields):
+    def _single_chain_mcmc(self, init, args, kwargs, collect_fields, remove_sites):
         rng_key, init_state, init_params = init
-        if init_state is None:
-            init_state = self.sampler.init(
+        # Check if _sample_fn is None, then we need to initialize the sampler.
+        if init_state is None or (getattr(self.sampler, "_sample_fn", None) is None):
+            new_init_state = self.sampler.init(
                 rng_key,
                 self.num_warmup,
                 init_params,
                 model_args=args,
                 model_kwargs=kwargs,
             )
+            init_state = new_init_state if init_state is None else init_state
         sample_fn, postprocess_fn = self._get_cached_fns()
-        diagnostics = (
+        diagnostics = (  # noqa: E731
             lambda x: self.sampler.get_diagnostics_str(x[0])
-            if rng_key.ndim == 1
+            if is_prng_key(rng_key) or self.sampler.is_ensemble_kernel
             else ""
-        )  # noqa: E731
+        )
         init_val = (init_state, args, kwargs) if self._jit_model_args else (init_state,)
         lower_idx = self._collection_params["lower"]
         upper_idx = self._collection_params["upper"]
@@ -411,14 +491,18 @@ class MCMC(object):
             upper_idx,
             sample_fn,
             init_val,
-            transform=_collect_fn(collect_fields),
+            transform=_collect_and_postprocess(
+                postprocess_fn, collect_fields, remove_sites
+            ),
             progbar=self.progress_bar,
             return_last_val=True,
             thinning=self.thinning,
             collection_size=collection_size,
             progbar_desc=partial(_get_progbar_desc_str, lower_idx, phase),
             diagnostics_fn=diagnostics,
-            num_chains=self.num_chains if self.chain_method == "parallel" else 1,
+            num_chains=self.num_chains
+            if (callable(self.chain_method) or self.chain_method == "parallel")
+            else 1,
         )
         states, last_val = collect_vals
         # Get first argument of type `HMCState`
@@ -426,18 +510,6 @@ class MCMC(object):
         if len(collect_fields) == 1:
             states = (states,)
         states = dict(zip(collect_fields, states))
-        # Apply constraints if number of samples is non-zero
-        site_values = tree_flatten(states[self._sample_field])[0]
-        # XXX: lax.map still works if some arrays have 0 size
-        # so we only need to filter out the case site_value.shape[0] == 0
-        # (which happens when lower_idx==upper_idx)
-        if len(site_values) > 0 and jnp.shape(site_values[0])[0] > 0:
-            if self._jit_model_args:
-                states[self._sample_field] = postprocess_fn(
-                    states[self._sample_field], args, kwargs
-                )
-            else:
-                states[self._sample_field] = postprocess_fn(states[self._sample_field])
         return states, last_state
 
     def _set_collection_params(
@@ -456,14 +528,23 @@ class MCMC(object):
             rng_key, *args, extra_fields=extra_fields, init_params=init_params, **kwargs
         )
         rng_key = (_hashable(rng_key),)
-        args = tree_map(lambda x: _hashable(x), args)
-        kwargs = tree_map(lambda x: _hashable(x), tuple(sorted(kwargs.items())))
+        args = jax.tree.map(lambda x: _hashable(x), args)
+        kwargs = jax.tree.map(lambda x: _hashable(x), tuple(sorted(kwargs.items())))
         key = rng_key + args + kwargs
         try:
             self._init_state_cache[key] = self._last_state
         # If unhashable arguments are provided, return None
         except TypeError:
             pass
+
+    def _get_states_flat(self):
+        if self._states_flat is None:
+            self._states_flat = jax.tree.map(
+                # need to calculate first dimension manually; see issue #1328
+                lambda x: jnp.reshape(x, (x.shape[0] * x.shape[1],) + x.shape[2:]),
+                self._states,
+            )
+        return self._states_flat
 
     @property
     def post_warmup_state(self):
@@ -506,7 +587,7 @@ class MCMC(object):
         **kwargs,
     ):
         """
-        Run the MCMC warmup adaptation phase. After this call, `self.warmup_state` will be set
+        Run the MCMC warmup adaptation phase. After this call, `self.post_warmup_state` will be set
         and the :meth:`run` method will skip the warmup adaptation phase. To run `warmup` again
         for the new data, it is required to run :meth:`warmup` again.
 
@@ -515,12 +596,18 @@ class MCMC(object):
             These are typically the arguments needed by the `model`.
         :param extra_fields: Extra fields (aside from :meth:`~numpyro.infer.mcmc.MCMCKernel.default_fields`)
             from the state object (e.g. :data:`numpyro.infer.hmc.HMCState` for HMC) to collect during
-            the MCMC run.
+            the MCMC run. Exclude sample sites from collection with "~`sampler.sample_field`.`sample_site`".
+            e.g. "~z.a" will prevent site "a" from being collected if you're using the NUTS sampler. To
+            collect samples of a site "a" in the unconstrained space, we can specify the variable here, e.g.
+            `extra_fields=("z.a",)`.
+
         :type extra_fields: tuple or list
         :param bool collect_warmup: Whether to collect samples from the warmup phase. Defaults
             to `False`.
         :param init_params: Initial parameters to begin sampling. The type must be consistent
-            with the input type to `potential_fn`.
+            with the input type to `potential_fn` provided to the kernel. If the kernel is
+            instantiated by a numpyro model, the initial parameters here correspond to latent
+            values in unconstrained space.
         :param kwargs: Keyword arguments to be provided to the :meth:`numpyro.infer.mcmc.MCMCKernel.init`
             method. These are typically the keyword arguments needed by the `model`.
         """
@@ -545,12 +632,18 @@ class MCMC(object):
             does not have batch_size, it will be split in to a batch of `num_chains` keys.
         :param args: Arguments to be provided to the :meth:`numpyro.infer.mcmc.MCMCKernel.init` method.
             These are typically the arguments needed by the `model`.
-        :param extra_fields: Extra fields (aside from `"z"`, `"diverging"`) to be collected
+        :param extra_fields: Extra fields (aside from `"z"`, `"diverging"`) from the
+            state object (e.g. :data:`numpyro.infer.hmc.HMCState` for HMC) to be collected
             during the MCMC run. Note that subfields can be accessed using dots, e.g.
-            `"adapt_state.step_size"` can be used to collect step sizes at each step.
+            `"adapt_state.step_size"` can be used to collect step sizes at each step. Exclude sample sites from
+            collection with "~`sampler.sample_field`.`sample_site`". e.g. "~z.a" will prevent site "a" from
+            being collected if you're using the NUTS sampler. To collect samples of a site "a" in the
+            unconstrained space, we can specify the variable here, e.g. `extra_fields=("z.a",)`.
         :type extra_fields: tuple or list of str
         :param init_params: Initial parameters to begin sampling. The type must be consistent
-            with the input type to `potential_fn`.
+            with the input type to `potential_fn` provided to the kernel. If the kernel is
+            instantiated by a numpyro model, the initial parameters here correspond to latent
+            values in unconstrained space.
         :param kwargs: Keyword arguments to be provided to the :meth:`numpyro.infer.mcmc.MCMCKernel.init`
             method. These are typically the keyword arguments needed by the `model`.
 
@@ -559,60 +652,71 @@ class MCMC(object):
             See https://jax.readthedocs.io/en/latest/async_dispatch.html and
             https://jax.readthedocs.io/en/latest/profiling.html for pointers on profiling jax programs.
         """
-        init_params = tree_map(
+        init_params = jax.tree.map(
             lambda x: lax.convert_element_type(x, jnp.result_type(x)), init_params
         )
         self._args = args
         self._kwargs = kwargs
         init_state = self._get_cached_init_state(rng_key, args, kwargs)
-        if self.num_chains > 1 and rng_key.ndim == 1:
+        if self.num_chains > 1 and is_prng_key(rng_key):
             rng_key = random.split(rng_key, self.num_chains)
 
         if self._warmup_state is not None:
             self._set_collection_params(0, self.num_samples, self.num_samples, "sample")
-            init_state = self._warmup_state._replace(rng_key=rng_key)
+
+            if self.sampler.is_ensemble_kernel:
+                init_state = self._warmup_state._replace(rng_key=rng_key[0])
+            else:
+                init_state = self._warmup_state._replace(rng_key=rng_key)
 
         if init_params is not None and self.num_chains > 1:
-            prototype_init_val = tree_flatten(init_params)[0][0]
+            prototype_init_val = jax.tree.flatten(init_params)[0][0]
             if jnp.shape(prototype_init_val)[0] != self.num_chains:
                 raise ValueError(
                     "`init_params` must have the same leading dimension"
                     " as `num_chains`."
                 )
         assert isinstance(extra_fields, (tuple, list))
-        collect_fields = tuple(
-            set(
-                (self._sample_field,)
-                + tuple(self._default_fields)
-                + tuple(extra_fields)
-            )
-        )
+
+        collect_fields = {}
+        remove_sites = {}
+        for field_name in (
+            (self._sample_field,) + tuple(self._default_fields) + tuple(extra_fields)
+        ):
+            if field_name.startswith(f"~{self._sample_field}."):
+                remove_sites[(field_name[len(self._sample_field) + 2 :])] = None
+            else:
+                collect_fields[field_name] = None
+        collect_fields = tuple(collect_fields.keys())
+        remove_sites = tuple(remove_sites.keys())
+
         partial_map_fn = partial(
             self._single_chain_mcmc,
             args=args,
             kwargs=kwargs,
             collect_fields=collect_fields,
+            remove_sites=remove_sites,
         )
         map_args = (rng_key, init_state, init_params)
         if self.num_chains == 1:
             states_flat, last_state = partial_map_fn(map_args)
-            states = tree_map(lambda x: x[jnp.newaxis, ...], states_flat)
+            states = jax.tree.map(lambda x: x[jnp.newaxis, ...], states_flat)
         else:
             if self.chain_method == "sequential":
                 states, last_state = _laxmap(partial_map_fn, map_args)
             elif self.chain_method == "parallel":
                 states, last_state = pmap(partial_map_fn)(map_args)
+            elif callable(self.chain_method):
+                states, last_state = self.chain_method(partial_map_fn)(map_args)
             else:
                 assert self.chain_method == "vectorized"
                 states, last_state = partial_map_fn(map_args)
                 # swap num_samples x num_chains to num_chains x num_samples
-                states = tree_map(lambda x: jnp.swapaxes(x, 0, 1), states)
-            states_flat = tree_map(
-                lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), states
-            )
+                states = jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), states)
+
         self._last_state = last_state
         self._states = states
-        self._states_flat = states_flat
+        self._states_flat = None
         self._set_collection_params()
 
     def get_samples(self, group_by_chain=False):
@@ -638,7 +742,7 @@ class MCMC(object):
         return (
             self._states[self._sample_field]
             if group_by_chain
-            else self._states_flat[self._sample_field]
+            else self._get_states_flat()[self._sample_field]
         )
 
     def get_extra_fields(self, group_by_chain=False):
@@ -650,7 +754,7 @@ class MCMC(object):
         :return: Extra fields keyed by field names which are specified in the
             `extra_fields` keyword of :meth:`run`.
         """
-        states = self._states if group_by_chain else self._states_flat
+        states = self._states if group_by_chain else self._get_states_flat()
         return {k: v for k, v in states.items() if k != self._sample_field}
 
     def print_summary(self, prob=0.9, exclude_deterministic=True):
@@ -682,6 +786,13 @@ class MCMC(object):
             print(
                 "Number of divergences: {}".format(jnp.sum(extra_fields["diverging"]))
             )
+
+    def transfer_states_to_host(self):
+        """
+        Reduce the memory footprint of collected samples by transferring them to the host device.
+        """
+        self._states = device_get(self._states)
+        self._states_flat = device_get(self._get_states_flat())
 
     def __getstate__(self):
         state = self.__dict__.copy()

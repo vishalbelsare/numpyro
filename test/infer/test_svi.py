@@ -1,21 +1,16 @@
 # Copyright Contributors to the Pyro project.
 # SPDX-License-Identifier: Apache-2.0
 
+from functools import partial
+
 import numpy as np
 from numpy.testing import assert_allclose
 import pytest
 
 import jax
-from jax import jit, random, value_and_grad
+from jax import jit, lax, random, value_and_grad
+from jax.example_libraries import optimizers
 import jax.numpy as jnp
-from jax.test_util import check_close
-
-from numpyro.util import _versiontuple
-
-if _versiontuple(jax.__version__) >= (0, 2, 25):
-    from jax.example_libraries import optimizers
-else:
-    from jax.experimental import optimizers
 
 import numpyro
 from numpyro import optim
@@ -30,8 +25,13 @@ from numpyro.infer import (
     TraceGraph_ELBO,
     TraceMeanField_ELBO,
 )
+from numpyro.infer.elbo import _apply_vmap
 from numpyro.primitives import mutable as numpyro_mutable
 from numpyro.util import fori_loop
+
+
+def assert_equal(a, b, prec=0):
+    return jax.tree.map(lambda a, b: assert_allclose(a, b, atol=prec), a, b)
 
 
 @pytest.mark.parametrize("alpha", [0.0, 2.0])
@@ -56,14 +56,161 @@ def test_renyi_elbo(alpha):
     assert_allclose(elbo_grad, renyi_grad, rtol=1e-6)
 
 
+def test_renyi_local():
+    def model(subsample_size=None):
+        with numpyro.plate("N", 100, subsample_size=subsample_size):
+            numpyro.sample("x", dist.Normal(0, 1))
+            numpyro.sample("obs", dist.Bernoulli(0.6), obs=1)
+
+    def guide(subsample_size=None):
+        with numpyro.plate("N", 100, subsample_size=subsample_size):
+            numpyro.sample("x", dist.Normal(0, 1))
+
+    def renyi_loss_fn(subsample_size=None):
+        return RenyiELBO(num_particles=10).loss(
+            random.PRNGKey(0), {}, model, guide, subsample_size
+        )
+
+    # Test that the scales are applied correctly.
+    # Here for each particle, log_p - log_q = log(0.6)
+    full_loss = renyi_loss_fn()
+    subsample_loss = renyi_loss_fn(subsample_size=2)
+    assert_allclose(full_loss, -jnp.log(0.6) * 100, rtol=1e-6)
+    assert_allclose(subsample_loss, full_loss, rtol=1e-6)
+
+
+def test_renyi_nonnested_plates():
+    def model():
+        with numpyro.plate("N", 10):
+            numpyro.sample("x", dist.Normal(0, 1))
+
+        with numpyro.plate("M", 10):
+            numpyro.sample("y", dist.Normal(0, 1))
+
+    def get_elbo():
+        renyi_elbo = RenyiELBO(num_particles=10)
+        return renyi_elbo._single_particle_elbo(
+            model,
+            model,
+            {},
+            (),
+            {},
+            random.PRNGKey(0),
+        )
+
+    elbo, _ = get_elbo()
+    assert elbo.shape == ()
+
+
+@pytest.mark.parametrize(
+    "n,k",
+    [(3, 5), (2, 5), (3, 3), (2, 3)],
+    ids=str,
+)
+def test_renyi_create_plates(n, k):
+    P = 10
+    N, M, K = 3, 4, 5
+    data = jnp.linspace(0.1, 0.9, N * M * K).reshape((N, M, K))
+
+    def model(data, n=N, k=K, fix_indices=True):
+        with numpyro.plate("N", N, subsample_size=n, dim=-3):
+            with numpyro.plate("M", M, dim=-2):
+                with numpyro.plate("K", K, subsample_size=k, dim=-1):
+                    if fix_indices:
+                        batch = data[:n, :, :k]
+                    else:
+                        batch = numpyro.subsample(data, event_dim=0)
+                    numpyro.sample("data", dist.Bernoulli(batch), obs=1)
+
+    def guide(data, n=N, k=K, fix_indices=True):
+        pass
+
+    def get_elbo(n=N, k=K, fix_indices=True):
+        renyi_elbo = RenyiELBO(num_particles=P)
+        return renyi_elbo._single_particle_elbo(
+            model,
+            guide,
+            {},
+            (data,),
+            dict(n=n, k=k, fix_indices=fix_indices),
+            random.PRNGKey(0),
+        )
+
+    def get_renyi(n=N, k=K, fix_indices=True):
+        renyi_elbo = RenyiELBO(num_particles=P)
+        return -renyi_elbo.loss(
+            random.PRNGKey(0), {}, model, guide, data, n=n, k=k, fix_indices=fix_indices
+        )
+
+    elbo, scale = get_elbo(n=n, k=k)
+    expected_shape = (n, M, k)
+    expected_scale = N * K / n / k
+    expected_elbo = jnp.log(data)[:n, :, :k]
+    assert elbo.shape == expected_shape
+    assert_allclose(scale, expected_scale, rtol=1e-6)
+    assert_allclose(elbo, expected_elbo, rtol=1e-6)
+
+    renyi = get_renyi(n=n, k=k)
+    assert_allclose(renyi, elbo.sum() * scale, rtol=1e-6)
+
+    if (n, k) == (2, 5):
+        renyi_random = get_renyi(n=2, fix_indices=False)
+        renyi_idx01 = jnp.log(data)[jnp.array([0, 1])].sum() * N / 2
+        renyi_idx02 = jnp.log(data)[jnp.array([0, 2])].sum() * N / 2
+        renyi_idx12 = jnp.log(data)[jnp.array([1, 2])].sum() * N / 2
+        atol = jnp.min(
+            jnp.abs(jnp.stack([renyi_idx01, renyi_idx02, renyi_idx12]) - renyi_random)
+        )
+        assert_allclose(atol, 0.0, atol=1e-5)
+
+
+def test_assign_vectorize_particles_fn():
+    elbo = Trace_ELBO()
+    assert elbo._assign_vectorize_particles_fn(True) == _apply_vmap
+    assert elbo._assign_vectorize_particles_fn(False) == jax.lax.map
+    assert elbo._assign_vectorize_particles_fn(jax.pmap) == jax.pmap
+    assert callable(elbo._assign_vectorize_particles_fn(lambda x: x))
+
+
+@pytest.mark.parametrize(
+    argnames="vectorize_particles",
+    argvalues=[True, False, jax.pmap, lambda x: x],
+    ids=["vmap", "lax", "pmap", "custom"],
+)
+def test_vectorized_particle(vectorize_particles):
+    data = jnp.array([1.0] * 8 + [0.0] * 2)
+
+    def model(data):
+        f = numpyro.sample("beta", dist.Beta(1.0, 1.0))
+        with numpyro.plate("N", len(data)):
+            numpyro.sample("obs", dist.Bernoulli(f), obs=data)
+
+    def guide(data):
+        alpha_q = numpyro.param("alpha_q", 1.0, constraint=constraints.positive)
+        beta_q = numpyro.param("beta_q", 1.0, constraint=constraints.positive)
+        numpyro.sample("beta", dist.Beta(alpha_q, beta_q))
+
+    results = SVI(
+        model,
+        guide,
+        optim.Adam(0.1),
+        Trace_ELBO(vectorize_particles=vectorize_particles),
+    ).run(random.PRNGKey(0), 100, data)
+    map_results = SVI(
+        model, guide, optim.Adam(0.1), Trace_ELBO(vectorize_particles=False)
+    ).run(random.PRNGKey(0), 100, data)
+    assert_allclose(results.losses, map_results.losses, atol=1e-5)
+
+
 @pytest.mark.parametrize("elbo", [Trace_ELBO(), RenyiELBO(num_particles=10)])
-@pytest.mark.parametrize("optimizer", [optim.Adam(0.05), optimizers.adam(0.05)])
+@pytest.mark.parametrize("optimizer", [optim.Adam(0.01), optimizers.adam(0.01)])
 def test_beta_bernoulli(elbo, optimizer):
     data = jnp.array([1.0] * 8 + [0.0] * 2)
 
     def model(data):
         f = numpyro.sample("beta", dist.Beta(1.0, 1.0))
-        numpyro.sample("obs", dist.Bernoulli(f), obs=data)
+        with numpyro.plate("N", len(data)):
+            numpyro.sample("obs", dist.Bernoulli(f), obs=data)
 
     def guide(data):
         alpha_q = numpyro.param("alpha_q", 1.0, constraint=constraints.positive)
@@ -78,23 +225,34 @@ def test_beta_bernoulli(elbo, optimizer):
         svi_state, _ = svi.update(val, data)
         return svi_state
 
-    svi_state = fori_loop(0, 2000, body_fn, svi_state)
+    svi_state = fori_loop(0, 10000, body_fn, svi_state)
     params = svi.get_params(svi_state)
+    actual_posterior_mean = (data.sum() + 1) / (data.shape[0] + 2)
     assert_allclose(
         params["alpha_q"] / (params["alpha_q"] + params["beta_q"]),
-        0.8,
-        atol=0.05,
-        rtol=0.05,
+        actual_posterior_mean,
+        atol=0.03,
+        rtol=0.03,
     )
 
 
-@pytest.mark.parametrize("progress_bar", [True, False])
-def test_run(progress_bar):
+@pytest.mark.parametrize(
+    argnames="vectorize_particles",
+    argvalues=[True, False, jax.pmap, lambda x: x],
+    ids=["vmap", "lax", "pmap", "custom"],
+)
+@pytest.mark.parametrize(
+    argnames="progress_bar",
+    argvalues=[True, False],
+    ids=["progress_bar", "no_progress_bar"],
+)
+def test_run(vectorize_particles, progress_bar):
     data = jnp.array([1.0] * 8 + [0.0] * 2)
 
     def model(data):
         f = numpyro.sample("beta", dist.Beta(1.0, 1.0))
-        numpyro.sample("obs", dist.Bernoulli(f), obs=data)
+        with numpyro.plate("N", len(data)):
+            numpyro.sample("obs", dist.Bernoulli(f), obs=data)
 
     def guide(data):
         alpha_q = numpyro.param(
@@ -107,7 +265,12 @@ def test_run(progress_bar):
         )
         numpyro.sample("beta", dist.Beta(alpha_q, beta_q))
 
-    svi = SVI(model, guide, optim.Adam(0.05), Trace_ELBO())
+    svi = SVI(
+        model,
+        guide,
+        optim.Adam(0.05),
+        Trace_ELBO(vectorize_particles=vectorize_particles),
+    )
     svi_result = svi.run(random.PRNGKey(1), 1000, data, progress_bar=progress_bar)
     params, losses = svi_result.params, svi_result.losses
     assert losses.shape == (1000,)
@@ -124,7 +287,8 @@ def test_jitted_update_fn():
 
     def model(data):
         f = numpyro.sample("beta", dist.Beta(1.0, 1.0))
-        numpyro.sample("obs", dist.Bernoulli(f), obs=data)
+        with numpyro.plate("N", len(data)):
+            numpyro.sample("obs", dist.Bernoulli(f), obs=data)
 
     def guide(data):
         alpha_q = numpyro.param("alpha_q", 1.0, constraint=constraints.positive)
@@ -134,10 +298,11 @@ def test_jitted_update_fn():
     adam = optim.Adam(0.05)
     svi = SVI(model, guide, adam, Trace_ELBO())
     svi_state = svi.init(random.PRNGKey(1), data)
-    expected = svi.get_params(svi.update(svi_state, data)[0])
 
+    expected = svi.get_params(svi.update(svi_state, data)[0])
     actual = svi.get_params(jit(svi.update)(svi_state, data=data)[0])
-    check_close(actual, expected, atol=1e-5)
+
+    jax.tree.all(jax.tree.map(partial(assert_allclose, atol=1e-5), actual, expected))
 
 
 def test_param():
@@ -182,6 +347,60 @@ def test_param():
     ).log_prob(obs)
     # not so precisely because we do transform / inverse transform stuffs
     assert_allclose(actual_loss, expected_loss, rtol=1e-6)
+
+
+def test_shared_param_init():
+    shared_init = 1.0
+
+    def model():
+        # should receive initial value from guide when used in SVI
+        shared = numpyro.param("shared")
+        assert_allclose(shared, shared_init)
+
+    def guide():
+        numpyro.param("shared", lambda _: shared_init)
+
+    svi = SVI(model, guide, optim.Adam(0.01), Trace_ELBO())
+    svi_state = svi.init(random.PRNGKey(0))
+    params = svi.get_params(svi_state)
+    # make sure the correct init ended up in the SVI state
+    assert_allclose(params["shared"], shared_init)
+
+
+def test_shared_param():
+    target_value = 5.0
+
+    def model():
+        shared = numpyro.param("shared")
+        # drive the shared parameter toward a target value
+        numpyro.factor("neg_loss", -((shared - target_value) ** 2))
+
+    def guide():
+        numpyro.param("shared", 1.0)
+
+    svi = SVI(model, guide, optim.Adam(0.01), Trace_ELBO())
+    svi_result = svi.run(random.PRNGKey(0), 1000)
+    assert_allclose(svi_result.params["shared"], target_value, atol=0.1)
+
+
+def test_init_params():
+    init_params = {"b": 1.0, "c": 2.0}
+
+    def model():
+        numpyro.param("a", 0.0)
+        # should receive initial value from init_params
+        numpyro.param("b")
+
+    def guide():
+        # should receive initial value from init_params
+        numpyro.param("c")
+
+    svi = SVI(model, guide, optim.Adam(0.01), Trace_ELBO())
+    svi_state = svi.init(random.PRNGKey(0), init_params=init_params)
+    params = svi.get_params(svi_state)
+    init_params["a"] = 0.0
+    # make sure init params ended up in the SVI state
+    assert_equal(params, init_params)
 
 
 def test_elbo_dynamic_support():
@@ -274,7 +493,7 @@ def test_mutable_state(stable_update, num_particles, elbo):
 
     svi = SVI(model, guide, optim.Adam(0.1), elbo(num_particles=num_particles))
     if num_particles > 1:
-        with pytest.raises(ValueError, match="mutable state"):
+        with pytest.warns(UserWarning, match="mutable state"):
             svi_result = svi.run(random.PRNGKey(0), 1000, stable_update=stable_update)
         return
     svi_result = svi.run(random.PRNGKey(0), 1000, stable_update=stable_update)
@@ -549,3 +768,39 @@ def test_tracegraph_gaussian_chain(num_latents, num_steps, step_size, atol, diff
 
     for i in range(3):
         assert_allclose(max_errors[i], 0, atol=atol)
+
+
+def test_multi_sample_guide():
+    actual_loc = 3.0
+    actual_scale = 2.0
+
+    def model():
+        numpyro.sample("x", dist.Normal(actual_loc, actual_scale))
+
+    def guide():
+        loc = numpyro.param("loc", 0.0)
+        scale = numpyro.param("scale", 1.0, constraint=constraints.positive)
+        numpyro.sample("x", dist.Normal(loc, scale).expand([10]))
+
+    svi = SVI(model, guide, optim.Adam(0.1), Trace_ELBO(multi_sample_guide=True))
+    svi_results = svi.run(random.PRNGKey(0), 2000)
+    params = svi_results.params
+    assert_allclose(params["loc"], actual_loc, rtol=0.1)
+    assert_allclose(params["scale"], actual_scale, rtol=0.1)
+
+
+def test_forward_mode_differentiation():
+    def model():
+        x = numpyro.sample("x", dist.Normal(0, 1))
+        y = lax.while_loop(lambda x: x < 10, lambda x: x + 1, x)
+        numpyro.sample("obs", dist.Normal(y, 1), obs=1.0)
+
+    def guide():
+        loc = numpyro.param("loc", 0.0)
+        scale = numpyro.param("scale", 1.0, constraint=dist.constraints.positive)
+        numpyro.sample("x", dist.Normal(loc, scale))
+
+    # this fails in reverse mode
+    optimizer = numpyro.optim.Adam(step_size=0.01)
+    svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
+    svi.run(random.PRNGKey(0), 1000, forward_mode_differentiation=True)

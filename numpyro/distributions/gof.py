@@ -63,6 +63,8 @@ import numpy as np
 
 import jax
 
+from numpyro.util import find_stack_level
+
 HISTOGRAM_WIDTH = 60
 
 
@@ -117,7 +119,10 @@ def multinomial_goodness_of_fit(probs, counts, *, total_count=None, plot=False):
             chi_squared += (c - mean) ** 2 / variance
             dof += 1
         else:
-            warnings.warn("Zero probability in goodness-of-fit test")
+            warnings.warn(
+                "Zero probability in goodness-of-fit test",
+                stacklevel=find_stack_level(),
+            )
             if c > 0:
                 return math.inf
 
@@ -153,7 +158,7 @@ def unif01_goodness_of_fit(samples, *, plot=False):
 
 def exp_goodness_of_fit(samples, plot=False):
     """
-    Transform exponentially distribued samples to Uniform(0,1) distribution and
+    Transform exponentially distributed samples to Uniform(0,1) distribution and
     assess goodness of fit via binned Pearson's chi^2 test.
 
     :param numpy.ndarray samples: A vector of real-valued samples from a
@@ -200,7 +205,7 @@ def density_goodness_of_fit(samples, probs, plot=False):
 
 
 def volume_of_sphere(dim, radius):
-    return radius ** dim * math.pi ** (0.5 * dim) / math.gamma(0.5 * dim + 1)
+    return radius**dim * math.pi ** (0.5 * dim) / math.gamma(0.5 * dim + 1)
 
 
 def get_nearest_neighbor_distances(samples):
@@ -348,7 +353,7 @@ def _chi2sf(x, s):
        F(x; s) = \frac{ \gamma( x/2, s/2 ) }{ \Gamma(s/2) },
 
     with :math:`\gamma` is the incomplete gamma function defined above.
-    Therefore, the survival probability is givne by:
+    Therefore, the survival probability is given by:
 
     .. math::
        1 - \frac{ \gamma( x/2, s/2 ) }{ \Gamma(s/2) }.

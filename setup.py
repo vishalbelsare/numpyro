@@ -9,8 +9,8 @@ import sys
 from setuptools import find_packages, setup
 
 PROJECT_PATH = os.path.dirname(os.path.abspath(__file__))
-_jax_version_constraints = ">=0.2.13"
-_jaxlib_version_constraints = ">=0.1.65"
+_jax_version_constraints = ">=0.4.25"
+_jaxlib_version_constraints = ">=0.4.25"
 
 # Find version
 for line in open(os.path.join(PROJECT_PATH, "numpyro", "version.py")):
@@ -35,33 +35,41 @@ setup(
     install_requires=[
         f"jax{_jax_version_constraints}",
         f"jaxlib{_jaxlib_version_constraints}",
+        "multipledispatch",
+        "numpy",
         "tqdm",
     ],
     extras_require={
         "doc": [
             "ipython",  # sphinx needs this to render codes
-            "nbsphinx>=0.8.5",
-            "readthedocs-sphinx-search==0.1.0",
-            "sphinx",
+            "nbsphinx>=0.8.9",
+            "readthedocs-sphinx-search>=0.3.2",
+            "sphinx>=5",
             "sphinx_rtd_theme",
             "sphinx-gallery",
         ],
         "test": [
-            "black[jupyter]>=21.8b0",
-            "flake8",
-            "isort>=5.0",
+            "importlib-metadata<5.0",
+            "ruff>=0.1.8",
+            "mypy>=1.13",
             "pytest>=4.1",
             "pyro-api>=0.1.1",
-            "scipy>=1.6,<1.7",
+            "scikit-learn",
+            "scipy>=1.9",
         ],
         "dev": [
             "dm-haiku",
             "flax",
-            "funsor==0.4.1",
+            "funsor>=0.4.1",
             "graphviz",
-            "jaxns==0.0.7",
+            "jaxns==2.6.3",
+            "matplotlib",
             "optax>=0.0.6",
-            "tensorflow_probability>=0.15.0",
+            "pylab-sdk",  # jaxns dependency
+            "pytest-cov",
+            "pyyaml",  # flax dependency
+            "requests",  # pylab dependency
+            "tensorflow_probability>=0.18.0",
         ],
         "examples": [
             "arviz",
@@ -74,10 +82,11 @@ setup(
         ],
         "cpu": f"jax[cpu]{_jax_version_constraints}",
         # TPU and CUDA installations, currently require to add package repository URL, i.e.,
-        # pip install numpyro[cuda] -f https://storage.googleapis.com/jax-releases/jax_releases.html
+        # pip install 'numpyro[cuda]' -f https://storage.googleapis.com/jax-releases/jax_releases.html
         "tpu": f"jax[tpu]{_jax_version_constraints}",
         "cuda": f"jax[cuda]{_jax_version_constraints}",
     },
+    python_requires=">=3.9",
     long_description=long_description,
     long_description_content_type="text/markdown",
     keywords="probabilistic machine learning bayesian statistics",
@@ -89,9 +98,10 @@ setup(
         "License :: OSI Approved :: Apache Software License",
         "Operating System :: POSIX :: Linux",
         "Operating System :: MacOS :: MacOS X",
-        "Programming Language :: Python :: 3.7",
-        "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
     ],
 )

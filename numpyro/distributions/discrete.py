@@ -25,8 +25,6 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-import warnings
-
 import numpy as np
 
 import jax
@@ -39,17 +37,17 @@ from jax.scipy.special import expit, gammaincc, gammaln, logsumexp, xlog1py, xlo
 from numpyro.distributions import constraints, transforms
 from numpyro.distributions.distribution import Distribution
 from numpyro.distributions.util import (
+    assert_one_of,
     binary_cross_entropy_with_logits,
     binomial,
     categorical,
     clamp_probs,
-    is_prng_key,
     lazy_property,
     multinomial,
     promote_shapes,
     validate_sample,
 )
-from numpyro.util import not_jax_tracer
+from numpyro.util import is_prng_key, not_jax_tracer
 
 
 def _to_probs_bernoulli(logits):
@@ -67,7 +65,7 @@ def _to_probs_multinom(logits):
 
 def _to_logits_multinom(probs):
     minval = jnp.finfo(jnp.result_type(probs)).min
-    return jnp.clip(jnp.log(probs), a_min=minval)
+    return jnp.clip(jnp.log(probs), minval)
 
 
 class BernoulliProbs(Distribution):
@@ -75,7 +73,7 @@ class BernoulliProbs(Distribution):
     support = constraints.boolean
     has_enumerate_support = True
 
-    def __init__(self, probs, validate_args=None):
+    def __init__(self, probs, *, validate_args=None):
         self.probs = probs
         super(BernoulliProbs, self).__init__(
             batch_shape=jnp.shape(self.probs), validate_args=validate_args
@@ -91,6 +89,7 @@ class BernoulliProbs(Distribution):
     @validate_sample
     def log_prob(self, value):
         ps_clamped = clamp_probs(self.probs)
+        value = jnp.array(value, jnp.result_type(float))
         return xlogy(value, ps_clamped) + xlog1py(1 - value, -ps_clamped)
 
     @lazy_property
@@ -111,13 +110,18 @@ class BernoulliProbs(Distribution):
             values = jnp.broadcast_to(values, values.shape[:1] + self.batch_shape)
         return values
 
+    def entropy(self):
+        return -self.probs * jnp.log(self.probs) - (1 - self.probs) * jnp.log1p(
+            -self.probs
+        )
+
 
 class BernoulliLogits(Distribution):
     arg_constraints = {"logits": constraints.real}
     support = constraints.boolean
     has_enumerate_support = True
 
-    def __init__(self, logits=None, validate_args=None):
+    def __init__(self, logits=None, *, validate_args=None):
         self.logits = logits
         super(BernoulliLogits, self).__init__(
             batch_shape=jnp.shape(self.logits), validate_args=validate_args
@@ -152,14 +156,17 @@ class BernoulliLogits(Distribution):
             values = jnp.broadcast_to(values, values.shape[:1] + self.batch_shape)
         return values
 
+    def entropy(self):
+        nexp = jnp.exp(-self.logits)
+        return ((1 + nexp) * jnp.log1p(nexp) + nexp * self.logits) / (1 + nexp)
 
-def Bernoulli(probs=None, logits=None, validate_args=None):
+
+def Bernoulli(probs=None, logits=None, *, validate_args=None):
+    assert_one_of(probs=probs, logits=logits)
     if probs is not None:
         return BernoulliProbs(probs, validate_args=validate_args)
     elif logits is not None:
         return BernoulliLogits(logits, validate_args=validate_args)
-    else:
-        raise ValueError("One of `probs` or `logits` must be specified.")
 
 
 class BinomialProbs(Distribution):
@@ -169,7 +176,7 @@ class BinomialProbs(Distribution):
     }
     has_enumerate_support = True
 
-    def __init__(self, probs, total_count=1, validate_args=None):
+    def __init__(self, probs, total_count=1, *, validate_args=None):
         self.probs, self.total_count = promote_shapes(probs, total_count)
         batch_shape = lax.broadcast_shapes(jnp.shape(probs), jnp.shape(total_count))
         super(BinomialProbs, self).__init__(
@@ -184,15 +191,17 @@ class BinomialProbs(Distribution):
 
     @validate_sample
     def log_prob(self, value):
+        value = jnp.array(value, jnp.result_type(float))
         log_factorial_n = gammaln(self.total_count + 1)
         log_factorial_k = gammaln(value + 1)
         log_factorial_nmk = gammaln(self.total_count - value + 1)
+        probs = clamp_probs(self.probs)
         return (
             log_factorial_n
             - log_factorial_k
             - log_factorial_nmk
-            + xlogy(value, self.probs)
-            + xlog1py(self.total_count - value, -self.probs)
+            + xlogy(value, probs)
+            + xlog1py(self.total_count - value, -probs)
         )
 
     @lazy_property
@@ -219,7 +228,7 @@ class BinomialProbs(Distribution):
             # NB: the error can't be raised if inhomogeneous issue happens when tracing
             if np.amin(self.total_count) != total_count:
                 raise NotImplementedError(
-                    "Inhomogeneous total count not supported" " by `enumerate_support`."
+                    "Inhomogeneous total count not supported by `enumerate_support`."
                 )
         else:
             total_count = jnp.amax(self.total_count)
@@ -239,7 +248,7 @@ class BinomialLogits(Distribution):
     has_enumerate_support = True
     enumerate_support = BinomialProbs.enumerate_support
 
-    def __init__(self, logits, total_count=1, validate_args=None):
+    def __init__(self, logits, total_count=1, *, validate_args=None):
         self.logits, self.total_count = promote_shapes(logits, total_count)
         batch_shape = lax.broadcast_shapes(jnp.shape(logits), jnp.shape(total_count))
         super(BinomialLogits, self).__init__(
@@ -254,12 +263,13 @@ class BinomialLogits(Distribution):
 
     @validate_sample
     def log_prob(self, value):
-        log_factorial_n = gammaln(self.total_count + 1)
+        total_count = jnp.array(self.total_count, dtype=jnp.result_type(float))
+        log_factorial_n = gammaln(total_count + 1)
         log_factorial_k = gammaln(value + 1)
-        log_factorial_nmk = gammaln(self.total_count - value + 1)
+        log_factorial_nmk = gammaln(total_count - value + 1)
         normalize_term = (
             self.total_count * jnp.clip(self.logits, 0)
-            + xlog1py(self.total_count, jnp.exp(-jnp.abs(self.logits)))
+            + xlog1py(total_count, jnp.exp(-jnp.abs(self.logits)))
             - log_factorial_n
         )
         return (
@@ -285,20 +295,19 @@ class BinomialLogits(Distribution):
         return constraints.integer_interval(0, self.total_count)
 
 
-def Binomial(total_count=1, probs=None, logits=None, validate_args=None):
+def Binomial(total_count=1, probs=None, logits=None, *, validate_args=None):
+    assert_one_of(probs=probs, logits=logits)
     if probs is not None:
         return BinomialProbs(probs, total_count, validate_args=validate_args)
     elif logits is not None:
         return BinomialLogits(logits, total_count, validate_args=validate_args)
-    else:
-        raise ValueError("One of `probs` or `logits` must be specified.")
 
 
 class CategoricalProbs(Distribution):
     arg_constraints = {"probs": constraints.simplex}
     has_enumerate_support = True
 
-    def __init__(self, probs, validate_args=None):
+    def __init__(self, probs, *, validate_args=None):
         if jnp.ndim(probs) < 1:
             raise ValueError("`probs` parameter must be at least one-dimensional.")
         self.probs = probs
@@ -343,12 +352,15 @@ class CategoricalProbs(Distribution):
             values = jnp.broadcast_to(values, values.shape[:1] + self.batch_shape)
         return values
 
+    def entropy(self):
+        return -(self.probs * jnp.log(self.probs)).sum(axis=-1)
+
 
 class CategoricalLogits(Distribution):
     arg_constraints = {"logits": constraints.real_vector}
     has_enumerate_support = True
 
-    def __init__(self, logits, validate_args=None):
+    def __init__(self, logits, *, validate_args=None):
         if jnp.ndim(logits) < 1:
             raise ValueError("`logits` parameter must be at least one-dimensional.")
         self.logits = logits
@@ -395,21 +407,28 @@ class CategoricalLogits(Distribution):
             values = jnp.broadcast_to(values, values.shape[:1] + self.batch_shape)
         return values
 
+    def entropy(self):
+        probs = softmax(self.logits, axis=-1)
+        return -(probs * self.logits).sum(axis=-1) + logsumexp(self.logits, axis=-1)
 
-def Categorical(probs=None, logits=None, validate_args=None):
+
+def Categorical(probs=None, logits=None, *, validate_args=None):
+    assert_one_of(probs=probs, logits=logits)
     if probs is not None:
         return CategoricalProbs(probs, validate_args=validate_args)
     elif logits is not None:
         return CategoricalLogits(logits, validate_args=validate_args)
-    else:
-        raise ValueError("One of `probs` or `logits` must be specified.")
 
 
 class DiscreteUniform(Distribution):
-    arg_constraints = {"low": constraints.dependent, "high": constraints.dependent}
+    arg_constraints = {
+        "low": constraints.dependent(is_discrete=True, event_dim=0),
+        "high": constraints.dependent(is_discrete=True, event_dim=0),
+    }
     has_enumerate_support = True
+    pytree_data_fields = ("low", "high", "_support")
 
-    def __init__(self, low=0, high=1, validate_args=None):
+    def __init__(self, low=0, high=1, *, validate_args=None):
         self.low, self.high = promote_shapes(low, high)
         batch_shape = lax.broadcast_shapes(jnp.shape(low), jnp.shape(high))
         self._support = constraints.integer_interval(low, high)
@@ -430,7 +449,7 @@ class DiscreteUniform(Distribution):
 
     def cdf(self, value):
         cdf = (jnp.floor(value) + 1 - self.low) / (self.high - self.low + 1)
-        return jnp.clip(cdf, a_min=0.0, a_max=1.0)
+        return jnp.clip(cdf, 0.0, 1.0)
 
     def icdf(self, value):
         return self.low + value * (self.high - self.low + 1) - 1
@@ -456,12 +475,15 @@ class DiscreteUniform(Distribution):
             raise NotImplementedError(
                 "Inhomogeneous `high` not supported by `enumerate_support`."
             )
-        values = (self.low + jnp.arange(np.amax(self.high - self.low) + 1)).reshape(
-            (-1,) + (1,) * len(self.batch_shape)
-        )
+        low = np.reshape(self.low, -1)[0]
+        high = np.reshape(self.high, -1)[0]
+        values = jnp.arange(low, high + 1).reshape((-1,) + (1,) * len(self.batch_shape))
         if expand:
             values = jnp.broadcast_to(values, values.shape[:1] + self.batch_shape)
         return values
+
+    def entropy(self):
+        return jnp.log(self.high - self.low + 1)
 
 
 class OrderedLogistic(CategoricalProbs):
@@ -483,7 +505,7 @@ class OrderedLogistic(CategoricalProbs):
         "cutpoints": constraints.ordered_vector,
     }
 
-    def __init__(self, predictor, cutpoints, validate_args=None):
+    def __init__(self, predictor, cutpoints, *, validate_args=None):
         if jnp.ndim(predictor) == 0:
             (predictor,) = promote_shapes(predictor, shape=(1,))
         else:
@@ -499,27 +521,8 @@ class OrderedLogistic(CategoricalProbs):
         event_shape = ()
         return batch_shape, event_shape
 
-
-class PRNGIdentity(Distribution):
-    """
-    Distribution over :func:`~jax.random.PRNGKey`. This can be used to
-    draw a batch of :func:`~jax.random.PRNGKey` using the :class:`~numpyro.handlers.seed`
-    handler. Only `sample` method is supported.
-    """
-
-    def __init__(self):
-        warnings.warn(
-            "PRNGIdentity distribution is deprecated. To get a random "
-            "PRNG key, you can use `numpyro.prng_key()` instead.",
-            FutureWarning,
-        )
-        super(PRNGIdentity, self).__init__(event_shape=(2,))
-
-    def sample(self, key, sample_shape=()):
-        return jnp.reshape(
-            random.split(key, np.prod(sample_shape).astype(np.int32)),
-            sample_shape + self.event_shape,
-        )
+    def entropy(self):
+        raise NotImplementedError
 
 
 class MultinomialProbs(Distribution):
@@ -527,8 +530,12 @@ class MultinomialProbs(Distribution):
         "probs": constraints.simplex,
         "total_count": constraints.nonnegative_integer,
     }
+    pytree_data_fields = ("probs",)
+    pytree_aux_fields = ("total_count", "total_count_max")
 
-    def __init__(self, probs, total_count=1, validate_args=None):
+    def __init__(
+        self, probs, total_count=1, *, total_count_max=None, validate_args=None
+    ):
         if jnp.ndim(probs) < 1:
             raise ValueError("`probs` parameter must be at least one-dimensional.")
         batch_shape, event_shape = self.infer_shapes(
@@ -536,6 +543,7 @@ class MultinomialProbs(Distribution):
         )
         self.probs = promote_shapes(probs, shape=batch_shape + jnp.shape(probs)[-1:])[0]
         self.total_count = promote_shapes(total_count, shape=batch_shape)[0]
+        self.total_count_max = total_count_max
         super(MultinomialProbs, self).__init__(
             batch_shape=batch_shape,
             event_shape=event_shape,
@@ -545,13 +553,16 @@ class MultinomialProbs(Distribution):
     def sample(self, key, sample_shape=()):
         assert is_prng_key(key)
         return multinomial(
-            key, self.probs, self.total_count, shape=sample_shape + self.batch_shape
+            key,
+            self.probs,
+            self.total_count,
+            shape=sample_shape + self.batch_shape,
+            total_count_max=self.total_count_max,
         )
 
     @validate_sample
     def log_prob(self, value):
-        if self._validate_args:
-            self._validate_sample(value)
+        value = jnp.array(value, jnp.result_type(float))
         return gammaln(self.total_count + 1) + jnp.sum(
             xlogy(value, self.probs) - gammaln(value + 1), axis=-1
         )
@@ -584,8 +595,12 @@ class MultinomialLogits(Distribution):
         "logits": constraints.real_vector,
         "total_count": constraints.nonnegative_integer,
     }
+    pytree_data_fields = ("logits",)
+    pytree_aux_fields = ("total_count", "total_count_max")
 
-    def __init__(self, logits, total_count=1, validate_args=None):
+    def __init__(
+        self, logits, total_count=1, *, total_count_max=None, validate_args=None
+    ):
         if jnp.ndim(logits) < 1:
             raise ValueError("`logits` parameter must be at least one-dimensional.")
         batch_shape, event_shape = self.infer_shapes(
@@ -595,6 +610,7 @@ class MultinomialLogits(Distribution):
             logits, shape=batch_shape + jnp.shape(logits)[-1:]
         )[0]
         self.total_count = promote_shapes(total_count, shape=batch_shape)[0]
+        self.total_count_max = total_count_max
         super(MultinomialLogits, self).__init__(
             batch_shape=batch_shape,
             event_shape=event_shape,
@@ -604,7 +620,11 @@ class MultinomialLogits(Distribution):
     def sample(self, key, sample_shape=()):
         assert is_prng_key(key)
         return multinomial(
-            key, self.probs, self.total_count, shape=sample_shape + self.batch_shape
+            key,
+            self.probs,
+            self.total_count,
+            shape=sample_shape + self.batch_shape,
+            total_count_max=self.total_count_max,
         )
 
     @validate_sample
@@ -641,13 +661,33 @@ class MultinomialLogits(Distribution):
         return batch_shape, event_shape
 
 
-def Multinomial(total_count=1, probs=None, logits=None, validate_args=None):
+def Multinomial(
+    total_count=1, probs=None, logits=None, *, total_count_max=None, validate_args=None
+):
+    """Multinomial distribution.
+
+    :param total_count: number of trials. If this is a JAX array,
+        it is required to specify `total_count_max`.
+    :param probs: event probabilities
+    :param logits: event log probabilities
+    :param int total_count_max: the maximum number of trials,
+        i.e. `max(total_count)`
+    """
+    assert_one_of(probs=probs, logits=logits)
     if probs is not None:
-        return MultinomialProbs(probs, total_count, validate_args=validate_args)
+        return MultinomialProbs(
+            probs,
+            total_count,
+            total_count_max=total_count_max,
+            validate_args=validate_args,
+        )
     elif logits is not None:
-        return MultinomialLogits(logits, total_count, validate_args=validate_args)
-    else:
-        raise ValueError("One of `probs` or `logits` must be specified.")
+        return MultinomialLogits(
+            logits,
+            total_count,
+            total_count_max=total_count_max,
+            validate_args=validate_args,
+        )
 
 
 class Poisson(Distribution):
@@ -663,8 +703,10 @@ class Poisson(Distribution):
     :param bool is_sparse: Whether to assume value is mostly zero when computing
         :meth:`log_prob`, which can speed up computation when data is sparse.
     """
+
     arg_constraints = {"rate": constraints.positive}
     support = constraints.nonnegative_integer
+    pytree_aux_fields = ("is_sparse",)
 
     def __init__(self, rate, *, is_sparse=False, validate_args=None):
         self.rate = rate
@@ -691,7 +733,7 @@ class Poisson(Distribution):
             sparse_value = value[nonzero]
             sparse_rate = rate[nonzero]
             return (
-                jnp.asarray(-rate)
+                jnp.asarray(-rate, dtype=jnp.result_type(float))
                 .at[nonzero]
                 .add(
                     jnp.log(sparse_rate) * sparse_value - gammaln(sparse_value + 1),
@@ -715,6 +757,7 @@ class Poisson(Distribution):
 
 class ZeroInflatedProbs(Distribution):
     arg_constraints = {"gate": constraints.unit_interval}
+    pytree_data_fields = ("base_dist", "gate")
 
     def __init__(self, base_dist, gate, *, validate_args=None):
         batch_shape = lax.broadcast_shapes(jnp.shape(gate), base_dist.batch_shape)
@@ -757,8 +800,8 @@ class ZeroInflatedProbs(Distribution):
     @lazy_property
     def variance(self):
         return (1 - self.gate) * (
-            self.base_dist.mean ** 2 + self.base_dist.variance
-        ) - self.mean ** 2
+            self.base_dist.mean**2 + self.base_dist.variance
+        ) - self.mean**2
 
     @property
     def has_enumerate_support(self):
@@ -796,10 +839,7 @@ def ZeroInflatedDistribution(
     :param numpy.ndarray gate: probability of extra zeros given via a Bernoulli distribution.
     :param numpy.ndarray gate_logits: logits of extra zeros given via a Bernoulli distribution.
     """
-    if (gate is None) == (gate_logits is None):
-        raise ValueError(
-            "Either `gate` or `gate_logits` must be specified, but not both."
-        )
+    assert_one_of(gate=gate, gate_logits=gate_logits)
     if gate is not None:
         return ZeroInflatedProbs(base_dist, gate, validate_args=validate_args)
     else:
@@ -816,10 +856,11 @@ class ZeroInflatedPoisson(ZeroInflatedProbs):
 
     arg_constraints = {"gate": constraints.unit_interval, "rate": constraints.positive}
     support = constraints.nonnegative_integer
+    pytree_data_fields = ("rate",)
 
     # TODO: resolve inconsistent parameter order w.r.t. Pyro
     # and support `gate_logits` argument
-    def __init__(self, gate, rate=1.0, validate_args=None):
+    def __init__(self, gate, rate=1.0, *, validate_args=None):
         _, self.rate = promote_shapes(gate, rate)
         super().__init__(Poisson(self.rate), gate, validate_args=validate_args)
 
@@ -828,7 +869,7 @@ class GeometricProbs(Distribution):
     arg_constraints = {"probs": constraints.unit_interval}
     support = constraints.nonnegative_integer
 
-    def __init__(self, probs, validate_args=None):
+    def __init__(self, probs, *, validate_args=None):
         self.probs = probs
         super(GeometricProbs, self).__init__(
             batch_shape=jnp.shape(self.probs), validate_args=validate_args
@@ -859,12 +900,17 @@ class GeometricProbs(Distribution):
     def variance(self):
         return (1.0 / self.probs - 1.0) / self.probs
 
+    def entropy(self):
+        return -(1 - self.probs) * jnp.log1p(-self.probs) / self.probs - jnp.log(
+            self.probs
+        )
+
 
 class GeometricLogits(Distribution):
     arg_constraints = {"logits": constraints.real}
     support = constraints.nonnegative_integer
 
-    def __init__(self, logits, validate_args=None):
+    def __init__(self, logits, *, validate_args=None):
         self.logits = logits
         super(GeometricLogits, self).__init__(
             batch_shape=jnp.shape(self.logits), validate_args=validate_args
@@ -894,11 +940,17 @@ class GeometricLogits(Distribution):
     def variance(self):
         return (1.0 / self.probs - 1.0) / self.probs
 
+    def entropy(self):
+        logq = -jax.nn.softplus(self.logits)
+        logp = -jax.nn.softplus(-self.logits)
+        p = jax.scipy.special.expit(self.logits)
+        p_clip = jnp.clip(p, min=jnp.finfo(p).tiny)
+        return -(1 - p) * logq / p_clip - logp
 
-def Geometric(probs=None, logits=None, validate_args=None):
+
+def Geometric(probs=None, logits=None, *, validate_args=None):
+    assert_one_of(probs=probs, logits=logits)
     if probs is not None:
         return GeometricProbs(probs, validate_args=validate_args)
     elif logits is not None:
         return GeometricLogits(logits, validate_args=validate_args)
-    else:
-        raise ValueError("One of `probs` or `logits` must be specified.")

@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from functools import partial
+from typing import Any, Callable
 
-from jax import device_put, lax
+from jax import lax
 
 from numpyro import handlers
-from numpyro.contrib.control_flow.util import PytreeTrace
+from numpyro.ops.pytree import PytreeTrace
 from numpyro.primitives import _PYRO_STACK, apply_stack
 
 
@@ -14,6 +15,8 @@ def _subs_wrapper(subs_map, site):
     if isinstance(subs_map, dict) and site["name"] in subs_map:
         return subs_map[site["name"]]
     elif callable(subs_map):
+        if site["type"] == "deterministic":
+            return subs_map(site)
         rng_key = site["kwargs"].get("rng_key")
         subs_map = (
             handlers.seed(subs_map, rng_seed=rng_key)
@@ -66,11 +69,11 @@ def cond_wrapper(
 
     wrapped_true_fun = wrap_fn(true_fun, substitute_stack)
     wrapped_false_fun = wrap_fn(false_fun, substitute_stack)
-    wrapped_operand = device_put((rng_key, operand))
+    wrapped_operand = (rng_key, operand)
     return lax.cond(pred, wrapped_true_fun, wrapped_false_fun, wrapped_operand)
 
 
-def cond(pred, true_fun, false_fun, operand):
+def cond(pred: bool, true_fun: Callable, false_fun: Callable, operand: Any) -> Any:
     """
     This primitive conditionally applies ``true_fun`` or ``false_fun``. See
     :func:`jax.lax.cond` for more information.
@@ -157,6 +160,8 @@ def cond(pred, true_fun, false_fun, operand):
     value, pytree_trace = msg["value"]
 
     for msg in pytree_trace.trace.values():
+        if msg["type"] == "plate":
+            continue
         apply_stack(msg)
 
     return value
